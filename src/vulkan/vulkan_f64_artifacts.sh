@@ -104,8 +104,9 @@ compile_module solve_f64 src/vulkan/shaders/inverse_f64.comp \
 compile_module convert_f64 src/vulkan/shaders/convert_f64.comp
 
 for module in rhs_f64 inverse_f64 solve_f64; do
-    if ! grep -q ' Fma ' "$output/$module.dis"; then
-        echo "$module does not contain an explicit Double Fma" >&2
+    if ! grep -q 'OpFMul %double' "$output/$module.dis" \
+        || ! grep -q 'NoContraction' "$output/$module.dis"; then
+        echo "$module does not preserve ordered Double multiply/add steps" >&2
         exit 1
     fi
 done

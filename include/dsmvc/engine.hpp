@@ -31,6 +31,8 @@ enum class BackendKind : std::uint8_t {
 };
 
 enum class CpuPath : std::uint8_t {
+    // Automatic may fall back to scalar. Explicit SIMD values require that
+    // exact implementation to be compiled and supported by the current CPU.
     automatic,
     scalar,
     avx2,
@@ -194,6 +196,12 @@ public:
     void prepare(std::shared_ptr<const AxisPlan> plan) const;
     void defer(std::shared_ptr<const AxisPlan> plan) const;
     void seal() const;
+
+    // Buffer contract for this class and Executor below: strides cover the
+    // logical width of each row. Callers need only allocate (row_count - 1) *
+    // row_stride + logical_width elements; the final row does not require
+    // pitch padding. Executors do not access or modify row padding outside the
+    // logical width.
 
     void inverse_rows(const AxisPlan &plan,
                       const float *input, std::ptrdiff_t input_row_stride,

@@ -1,6 +1,7 @@
 #include <dsmvc/engine.hpp>
 
 #include "axis_plan_internal.hpp"
+#include "checked_size.hpp"
 #include "cpu_packed.hpp"
 
 #include <algorithm>
@@ -325,14 +326,6 @@ void inverse_columns_avx2(const AxisPlan &plan,
                           const float *input, std::ptrdiff_t input_row_stride,
                           float *output, std::ptrdiff_t output_row_stride,
                           std::int32_t column_count);
-void accumulate_2d_rhs_avx2(
-    const AxisPlan &horizontal,
-    const detail::PackedCpuPlan &packed_horizontal,
-    const detail::PackedCpuPlan &packed_vertical,
-    const float *input, std::ptrdiff_t input_row_stride,
-    float *output, std::ptrdiff_t output_row_stride,
-    std::int32_t first_destination_row,
-    std::int32_t last_destination_row);
 void solve_rhs_columns_avx2(
     const AxisPlan &plan, const detail::PackedCpuPlan &packed,
     float *output, std::ptrdiff_t output_row_stride,
@@ -553,8 +546,16 @@ PackedCpuPlan pack_cpu_plan(
     packed.identity = identity ? identity : packed.axis.get();
     const auto &plan = *packed.axis;
     const auto n = plan.destination_size;
-    packed.padded_source_size = (plan.source_size + 7) & ~7;
-    packed.padded_destination_size = (n + 7) & ~7;
+    packed.padded_source_size = checked_size_i32(
+        checked_size_round_up(
+            static_cast<std::size_t>(plan.source_size), 8U,
+            "CPU packed source"),
+        "CPU packed source");
+    packed.padded_destination_size = checked_size_i32(
+        checked_size_round_up(
+            static_cast<std::size_t>(n), 8U,
+            "CPU packed destination"),
+        "CPU packed destination");
     const auto padded_n = static_cast<std::size_t>(packed.padded_destination_size);
     packed.weights_left.assign(padded_n, 0);
     packed.weights_right.assign(padded_n, 0);
@@ -597,9 +598,11 @@ PackedCpuPlan pack_cpu_plan(
         packed.streaming_cache_blocks = std::max(
             packed.streaming_cache_blocks, block_count);
     }
-    packed.weights.assign(padded_n
-                              * static_cast<std::size_t>(packed.weights_columns),
-                          0.0F);
+    packed.weights.assign(
+        checked_size_product(
+            padded_n, static_cast<std::size_t>(packed.weights_columns),
+            "CPU packed weights"),
+        0.0F);
     for (std::int32_t row = 0; row < n; ++row) {
         const auto begin = plan.transpose_offsets[static_cast<std::size_t>(row)];
         const auto end = plan.transpose_offsets[static_cast<std::size_t>(row) + 1U];
@@ -614,7 +617,10 @@ PackedCpuPlan pack_cpu_plan(
     }
 
     packed.source_offsets.assign(
-        static_cast<std::size_t>(plan.source_size) + 1U, 0U);
+        checked_size_add(
+            static_cast<std::size_t>(plan.source_size), 1U,
+            "CPU packed source offsets"),
+        0U);
     for (const auto source : plan.transpose_indices) {
         ++packed.source_offsets[static_cast<std::size_t>(source) + 1U];
     }
@@ -636,8 +642,10 @@ PackedCpuPlan pack_cpu_plan(
     }
 
     const auto bands = static_cast<std::size_t>(plan.half_bandwidth);
-    packed.lower_ld.assign(bands * padded_n, 0.0F);
-    packed.upper_l.assign(bands * padded_n, 0.0F);
+    const auto packed_factors = checked_size_product(
+        bands, padded_n, "CPU packed factors");
+    packed.lower_ld.assign(packed_factors, 0.0F);
+    packed.upper_l.assign(packed_factors, 0.0F);
     packed.inverse_diagonal.assign(padded_n, 0.0F);
     std::copy(plan.inverse_diagonal.begin(), plan.inverse_diagonal.end(),
               packed.inverse_diagonal.begin());
@@ -716,21 +724,36 @@ bool cpu_neon_available() noexcept {
 }
 
 CpuExecutor::CpuExecutor(CpuPath requested) {
-#if defined(DSMVC_HAS_NEON_OBJECT)
-    if (requested == CpuPath::neon && !cpu_neon_available()) {
-        throw std::runtime_error("opt=2 requires an AArch64 NEON capable CPU");
+    switch (requested) {
+    case CpuPath::automatic:
+        if (cpu_avx2_available()) {
+            path_ = CpuPath::avx2;
+        } else if (cpu_neon_available()) {
+            path_ = CpuPath::neon;
+        } else {
+            path_ = CpuPath::scalar;
+        }
+        break;
+    case CpuPath::scalar:
+        path_ = CpuPath::scalar;
+        break;
+    case CpuPath::avx2:
+        if (!cpu_avx2_available()) {
+            throw std::runtime_error(
+                "the explicit AVX2 path requires compiled AVX2 and FMA support");
+        }
+        path_ = CpuPath::avx2;
+        break;
+    case CpuPath::neon:
+        if (!cpu_neon_available()) {
+            throw std::runtime_error(
+                "the explicit NEON path requires compiled AArch64 NEON support");
+        }
+        path_ = CpuPath::neon;
+        break;
+    default:
+        throw std::invalid_argument("invalid explicit CPU path");
     }
-    path_ = requested == CpuPath::automatic
-        ? (cpu_neon_available() ? CpuPath::neon : CpuPath::scalar)
-        : requested;
-#else
-    if (requested == CpuPath::avx2 && !cpu_avx2_available()) {
-        throw std::runtime_error("opt=2 requires an AVX2 and FMA capable CPU");
-    }
-    path_ = requested == CpuPath::automatic
-        ? (cpu_avx2_available() ? CpuPath::avx2 : CpuPath::scalar)
-        : requested;
-#endif
     impl_ = std::make_shared<Impl>(path_);
 }
 
@@ -739,11 +762,12 @@ CpuExecutor::~CpuExecutor() = default;
 CpuPath CpuExecutor::path() const noexcept { return path_; }
 
 const char *CpuExecutor::name() const noexcept {
-#if defined(DSMVC_HAS_NEON_OBJECT)
-    return path_ == CpuPath::neon ? "neon-fma" : "scalar";
-#else
-    return path_ == CpuPath::avx2 ? "avx2-fma" : "scalar";
-#endif
+    switch (path_) {
+    case CpuPath::scalar: return "scalar";
+    case CpuPath::avx2: return "avx2-fma";
+    case CpuPath::neon: return "neon-fma";
+    default: return "invalid";
+    }
 }
 
 CpuPlanPackingStats CpuExecutor::packing_stats() const noexcept {
@@ -751,6 +775,20 @@ CpuPlanPackingStats CpuExecutor::packing_stats() const noexcept {
 }
 
 namespace {
+
+void require_finite_matrix(
+    const float *values, std::int32_t rows, std::int32_t columns,
+    std::ptrdiff_t row_stride, const char *message) {
+    for (std::int32_t row = 0; row < rows; ++row) {
+        const auto *source = values
+            + static_cast<std::ptrdiff_t>(row) * row_stride;
+        for (std::int32_t column = 0; column < columns; ++column) {
+            if (!std::isfinite(source[column])) {
+                throw std::runtime_error(message);
+            }
+        }
+    }
+}
 
 void inverse_rows_f64(
     const AxisPlan &plan,
@@ -792,18 +830,25 @@ void CpuExecutor::inverse_rows(const AxisPlan &plan,
                                const float *input, std::ptrdiff_t input_row_stride,
                                float *output, std::ptrdiff_t output_row_stride,
                                std::int32_t row_count) const {
-    if (!plan.valid() || !input || !output || input_row_stride <= 0
-        || output_row_stride <= 0 || row_count < 0) {
+    if (!plan.valid() || !input || !output
+        || input_row_stride < plan.source_size
+        || output_row_stride < plan.destination_size || row_count < 0) {
         throw std::invalid_argument("invalid row executor arguments");
     }
     if (plan.requires_float64()) {
+        require_finite_matrix(
+            input, row_count, plan.source_size, input_row_stride,
+            "CPU Float64 row input contains NaN or infinity");
+        const auto execute = [&] {
 #if defined(DSMVC_HAS_AVX2_OBJECT)
         if (path_ == CpuPath::avx2) {
             const auto complete_groups = static_cast<std::size_t>(row_count / 4);
             const auto task_count = std::min(
                 impl_->workers->parallelism(), complete_groups);
-            const auto enough_work = static_cast<std::size_t>(row_count)
-                * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+            const auto enough_work = detail::checked_size_product(
+                static_cast<std::size_t>(row_count),
+                static_cast<std::size_t>(plan.destination_size),
+                "CPU Float64 row work") >= 262144U;
             if (task_count != 0U && enough_work
                 && impl_->workers->try_run(
                     task_count, [&](std::size_t task) {
@@ -849,8 +894,10 @@ void CpuExecutor::inverse_rows(const AxisPlan &plan,
             const auto complete_groups = static_cast<std::size_t>(row_count / 4);
             const auto task_count = std::min(
                 impl_->workers->parallelism(), complete_groups);
-            const auto enough_work = static_cast<std::size_t>(row_count)
-                * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+            const auto enough_work = detail::checked_size_product(
+                static_cast<std::size_t>(row_count),
+                static_cast<std::size_t>(plan.destination_size),
+                "CPU Float64 row work") >= 262144U;
             if (task_count != 0U && enough_work
                 && impl_->workers->try_run(
                     task_count, [&](std::size_t task) {
@@ -894,6 +941,11 @@ void CpuExecutor::inverse_rows(const AxisPlan &plan,
         inverse_rows_f64(
             plan, input, input_row_stride, output, output_row_stride,
             row_count, *impl_->workers);
+        };
+        execute();
+        require_finite_matrix(
+            output, row_count, plan.destination_size, output_row_stride,
+            "CPU Float64 row execution produced NaN or infinity");
         return;
     }
 #if defined(DSMVC_HAS_AVX2_OBJECT)
@@ -902,8 +954,10 @@ void CpuExecutor::inverse_rows(const AxisPlan &plan,
         const auto complete_groups = static_cast<std::size_t>(row_count / 8);
         const auto task_count = std::min(
             impl_->workers->parallelism(), complete_groups);
-        const auto enough_work = static_cast<std::size_t>(row_count)
-            * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+        const auto enough_work = detail::checked_size_product(
+            static_cast<std::size_t>(row_count),
+            static_cast<std::size_t>(plan.destination_size),
+            "CPU row work") >= 262144U;
         if (enough_work && impl_->workers->try_run(
                 task_count, [&](std::size_t task) {
                     const auto first_group = complete_groups * task / task_count;
@@ -939,8 +993,10 @@ void CpuExecutor::inverse_rows(const AxisPlan &plan,
         const auto complete_groups = static_cast<std::size_t>(row_count / 4);
         const auto task_count = std::min(
             impl_->workers->parallelism(), complete_groups);
-        const auto enough_work = static_cast<std::size_t>(row_count)
-            * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+        const auto enough_work = detail::checked_size_product(
+            static_cast<std::size_t>(row_count),
+            static_cast<std::size_t>(plan.destination_size),
+            "CPU row work") >= 262144U;
         if (enough_work && impl_->workers->try_run(
                 task_count, [&](std::size_t task) {
                     const auto first_group = complete_groups * task / task_count;
@@ -982,19 +1038,26 @@ void CpuExecutor::inverse_columns(const AxisPlan &plan,
                                   const float *input, std::ptrdiff_t input_row_stride,
                                   float *output, std::ptrdiff_t output_row_stride,
                                   std::int32_t column_count) const {
-    if (!plan.valid() || !input || !output || input_row_stride <= 0
-        || output_row_stride <= 0 || column_count < 0) {
+    if (!plan.valid() || !input || !output || column_count < 0
+        || input_row_stride < column_count
+        || output_row_stride < column_count) {
         throw std::invalid_argument("invalid column executor arguments");
     }
     if (plan.requires_float64()) {
+        require_finite_matrix(
+            input, plan.source_size, column_count, input_row_stride,
+            "CPU Float64 column input contains NaN or infinity");
+        const auto execute = [&] {
 #if defined(DSMVC_HAS_AVX2_OBJECT)
         if (path_ == CpuPath::avx2) {
             const auto complete_groups = static_cast<std::size_t>(
                 column_count / 4);
             const auto task_count = std::min(
                 impl_->workers->parallelism(), complete_groups);
-            const auto enough_work = static_cast<std::size_t>(column_count)
-                * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+            const auto enough_work = detail::checked_size_product(
+                static_cast<std::size_t>(column_count),
+                static_cast<std::size_t>(plan.destination_size),
+                "CPU Float64 column work") >= 262144U;
             if (task_count != 0U && enough_work
                 && impl_->workers->try_run(
                     task_count, [&](std::size_t task) {
@@ -1032,8 +1095,10 @@ void CpuExecutor::inverse_columns(const AxisPlan &plan,
                 column_count / 4);
             const auto task_count = std::min(
                 impl_->workers->parallelism(), complete_groups);
-            const auto enough_work = static_cast<std::size_t>(column_count)
-                * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+            const auto enough_work = detail::checked_size_product(
+                static_cast<std::size_t>(column_count),
+                static_cast<std::size_t>(plan.destination_size),
+                "CPU Float64 column work") >= 262144U;
             if (task_count != 0U && enough_work
                 && impl_->workers->try_run(
                     task_count, [&](std::size_t task) {
@@ -1069,20 +1134,24 @@ void CpuExecutor::inverse_columns(const AxisPlan &plan,
         inverse_columns_f64(
             plan, input, input_row_stride, output, output_row_stride,
             column_count, *impl_->workers);
+        };
+        execute();
+        require_finite_matrix(
+            output, plan.destination_size, column_count, output_row_stride,
+            "CPU Float64 column execution produced NaN or infinity");
         return;
     }
 #if defined(DSMVC_HAS_AVX2_OBJECT)
     if (path_ == CpuPath::avx2) {
         const auto packed = impl_->get(plan);
-        const auto padded_columns = (column_count + 7) & ~7;
-        const auto vector_columns = input_row_stride >= padded_columns
-                && output_row_stride >= padded_columns
-            ? padded_columns : (column_count & ~7);
+        const auto vector_columns = column_count & ~7;
         const auto column_groups = static_cast<std::size_t>(vector_columns / 8);
         const auto task_count = std::min(
             impl_->workers->parallelism(), column_groups);
-        const auto enough_work = static_cast<std::size_t>(column_count)
-            * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+        const auto enough_work = detail::checked_size_product(
+            static_cast<std::size_t>(column_count),
+            static_cast<std::size_t>(plan.destination_size),
+            "CPU column work") >= 262144U;
         if (enough_work && impl_->workers->try_run(
                 task_count, [&](std::size_t task) {
                     const auto first_group = column_groups * task / task_count;
@@ -1109,15 +1178,14 @@ void CpuExecutor::inverse_columns(const AxisPlan &plan,
 #elif defined(DSMVC_HAS_NEON_OBJECT)
     if (path_ == CpuPath::neon) {
         const auto packed = impl_->get(plan);
-        const auto padded_columns = (column_count + 3) & ~3;
-        const auto vector_columns = input_row_stride >= padded_columns
-                && output_row_stride >= padded_columns
-            ? padded_columns : (column_count & ~3);
+        const auto vector_columns = column_count & ~3;
         const auto column_groups = static_cast<std::size_t>(vector_columns / 4);
         const auto task_count = std::min(
             impl_->workers->parallelism(), column_groups);
-        const auto enough_work = static_cast<std::size_t>(column_count)
-            * static_cast<std::size_t>(plan.destination_size) >= 262144U;
+        const auto enough_work = detail::checked_size_product(
+            static_cast<std::size_t>(column_count),
+            static_cast<std::size_t>(plan.destination_size),
+            "CPU column work") >= 262144U;
         if (enough_work && impl_->workers->try_run(
                 task_count, [&](std::size_t task) {
                     const auto first_group = column_groups * task / task_count;
@@ -1173,8 +1241,10 @@ void inverse_rows_f64(
     const float *input, std::ptrdiff_t input_row_stride,
     float *output, std::ptrdiff_t output_row_stride,
     std::int32_t row_count, WorkerPool &workers) {
-    const auto work = static_cast<std::size_t>(row_count)
-        * static_cast<std::size_t>(plan.destination_size);
+    const auto work = detail::checked_size_product(
+        static_cast<std::size_t>(row_count),
+        static_cast<std::size_t>(plan.destination_size),
+        "CPU Float64 row work");
     run_parallel_ranges(workers, row_count, work,
         [&](std::int32_t first, std::int32_t last) {
             std::vector<double> source(
@@ -1207,8 +1277,10 @@ void inverse_columns_f64(
     const float *input, std::ptrdiff_t input_row_stride,
     float *output, std::ptrdiff_t output_row_stride,
     std::int32_t column_count, WorkerPool &workers) {
-    const auto work = static_cast<std::size_t>(column_count)
-        * static_cast<std::size_t>(plan.destination_size);
+    const auto work = detail::checked_size_product(
+        static_cast<std::size_t>(column_count),
+        static_cast<std::size_t>(plan.destination_size),
+        "CPU Float64 column work");
     run_parallel_ranges(workers, column_count, work,
         [&](std::int32_t first, std::int32_t last) {
             std::vector<double> source(
@@ -1241,12 +1313,15 @@ void inverse_2d_f64_avx2(
     float *output, std::ptrdiff_t output_row_stride,
     WorkerPool &workers) {
     const auto intermediate_stride = horizontal.destination_size;
-    std::vector<double> intermediate(
-        static_cast<std::size_t>(vertical.source_size)
-        * static_cast<std::size_t>(intermediate_stride));
+    std::vector<double> intermediate(detail::checked_size_product(
+        static_cast<std::size_t>(vertical.source_size),
+        static_cast<std::size_t>(intermediate_stride),
+        "CPU Float64 intermediate"));
 
-    const auto horizontal_work = static_cast<std::size_t>(vertical.source_size)
-        * static_cast<std::size_t>(horizontal.destination_size);
+    const auto horizontal_work = detail::checked_size_product(
+        static_cast<std::size_t>(vertical.source_size),
+        static_cast<std::size_t>(horizontal.destination_size),
+        "CPU Float64 horizontal work");
     run_parallel_ranges(workers, vertical.source_size, horizontal_work,
         [&](std::int32_t first, std::int32_t last) {
             inverse_rows_to_f64_avx2(
@@ -1258,9 +1333,10 @@ void inverse_2d_f64_avx2(
                 intermediate_stride, last - first);
         });
 
-    const auto vertical_work = static_cast<std::size_t>(
-        horizontal.destination_size)
-        * static_cast<std::size_t>(vertical.destination_size);
+    const auto vertical_work = detail::checked_size_product(
+        static_cast<std::size_t>(horizontal.destination_size),
+        static_cast<std::size_t>(vertical.destination_size),
+        "CPU Float64 vertical work");
     run_parallel_ranges(workers, horizontal.destination_size, vertical_work,
         [&](std::int32_t first, std::int32_t last) {
             inverse_columns_from_f64_avx2(
@@ -1279,12 +1355,15 @@ void inverse_2d_f64(
     const IntegerConversion *conversion, WorkerPool &workers,
     bool use_neon) {
     const auto intermediate_stride = horizontal.destination_size;
-    std::vector<double> intermediate(
-        static_cast<std::size_t>(vertical.source_size)
-        * static_cast<std::size_t>(intermediate_stride));
+    std::vector<double> intermediate(detail::checked_size_product(
+        static_cast<std::size_t>(vertical.source_size),
+        static_cast<std::size_t>(intermediate_stride),
+        "CPU Float64 intermediate"));
 
-    const auto horizontal_work = static_cast<std::size_t>(vertical.source_size)
-        * static_cast<std::size_t>(horizontal.destination_size);
+    const auto horizontal_work = detail::checked_size_product(
+        static_cast<std::size_t>(vertical.source_size),
+        static_cast<std::size_t>(horizontal.destination_size),
+        "CPU Float64 horizontal work");
     run_parallel_ranges(workers, vertical.source_size, horizontal_work,
         [&](std::int32_t first, std::int32_t last) {
 #if defined(DSMVC_HAS_NEON_OBJECT)
@@ -1330,9 +1409,11 @@ void inverse_2d_f64(
             }
         });
 
-    const auto vertical_work = static_cast<std::size_t>(
-        horizontal.destination_size)
-        * static_cast<std::size_t>(vertical.destination_size);
+    const auto vertical_work = detail::checked_size_product(
+        static_cast<std::size_t>(horizontal.destination_size),
+        static_cast<std::size_t>(vertical.destination_size),
+        "CPU Float64 vertical work");
+    std::atomic<bool> nonfinite{false};
     run_parallel_ranges(workers, horizontal.destination_size, vertical_work,
         [&](std::int32_t first, std::int32_t last) {
 #if defined(DSMVC_HAS_NEON_OBJECT)
@@ -1357,13 +1438,25 @@ void inverse_2d_f64(
                     const double value =
                         destination[static_cast<std::size_t>(row)];
                     if constexpr (std::is_same_v<Sample, float>) {
+                        const float converted = static_cast<float>(value);
+                        if (!std::isfinite(value)
+                            || !std::isfinite(converted)) {
+                            nonfinite.store(true, std::memory_order_relaxed);
+                        }
                         output[static_cast<std::ptrdiff_t>(row)
-                                   * output_row_stride + column] =
-                            static_cast<float>(value);
+                                   * output_row_stride + column] = converted;
                     } else {
-                        const double converted = std::clamp(
+                        const double scaled =
                             value * static_cast<double>(conversion->output_scale)
-                                + static_cast<double>(conversion->output_offset),
+                            + static_cast<double>(conversion->output_offset);
+                        if (!std::isfinite(value) || !std::isfinite(scaled)) {
+                            nonfinite.store(true, std::memory_order_relaxed);
+                            output[static_cast<std::ptrdiff_t>(row)
+                                       * output_row_stride + column] = Sample{};
+                            continue;
+                        }
+                        const double converted = std::clamp(
+                            scaled,
                             0.0,
                             static_cast<double>(conversion->output_maximum));
                         output[static_cast<std::ptrdiff_t>(row)
@@ -1373,6 +1466,10 @@ void inverse_2d_f64(
                 }
             }
         });
+    if (nonfinite.load(std::memory_order_relaxed)) {
+        throw std::runtime_error(
+            "CPU Float64 2D execution produced NaN or infinity");
+    }
 }
 
 void solve_rhs_scalar(const AxisPlan &plan, float *values,
@@ -1455,7 +1552,9 @@ void forward_2d_rhs_scalar(
     thread_local std::vector<std::int32_t> cache_sources;
     thread_local std::vector<std::uint64_t> cache_ages;
     thread_local std::vector<const float *> source_rows;
-    horizontal_cache.resize(cache_rows * static_cast<std::size_t>(columns));
+    horizontal_cache.resize(detail::checked_size_product(
+        cache_rows, static_cast<std::size_t>(columns),
+        "CPU horizontal row cache"));
     source_scratch.resize(static_cast<std::size_t>(horizontal.source_size));
     cache_sources.assign(cache_rows, -1);
     cache_ages.assign(cache_rows, 0U);
@@ -1673,6 +1772,11 @@ void CpuExecutor::inverse_2d(
     }
 
     if (horizontal.requires_float64() || vertical.requires_float64()) {
+        require_finite_matrix(
+            input, vertical.source_size, horizontal.source_size,
+            input_row_stride,
+            "CPU Float64 2D input contains NaN or infinity");
+        const auto execute = [&] {
 #if defined(DSMVC_HAS_AVX2_OBJECT)
         if (path_ == CpuPath::avx2) {
             inverse_2d_f64_avx2(
@@ -1690,6 +1794,12 @@ void CpuExecutor::inverse_2d(
             output, output_row_stride,
             static_cast<const IntegerConversion *>(nullptr), *impl_->workers,
             use_neon);
+        };
+        execute();
+        require_finite_matrix(
+            output, vertical.destination_size, horizontal.destination_size,
+            output_row_stride,
+            "CPU Float64 2D execution produced NaN or infinity");
         return;
     }
 
@@ -1699,9 +1809,10 @@ void CpuExecutor::inverse_2d(
         const auto intermediate_stride =
             packed_horizontal->padded_destination_size;
         thread_local std::vector<float> intermediate;
-        intermediate.resize(
-            static_cast<std::size_t>(vertical.source_size)
-            * static_cast<std::size_t>(intermediate_stride));
+        intermediate.resize(detail::checked_size_product(
+            static_cast<std::size_t>(vertical.source_size),
+            static_cast<std::size_t>(intermediate_stride),
+            "CPU 2D intermediate"));
         inverse_rows(
             horizontal, input, input_row_stride,
             intermediate.data(), intermediate_stride, vertical.source_size);
@@ -1715,8 +1826,7 @@ void CpuExecutor::inverse_2d(
 #if defined(DSMVC_HAS_AVX2_OBJECT)
     if (path_ == CpuPath::avx2) {
         const auto packed_horizontal = impl_->get(horizontal);
-        if (vertical.source_size >= 8
-            && input_row_stride >= packed_horizontal->padded_source_size) {
+        if (vertical.source_size >= 8) {
             forward_2d_rhs_avx2(
                 horizontal, *packed_horizontal, vertical, *packed_vertical,
                 input, input_row_stride, output, output_row_stride,
@@ -1777,15 +1887,18 @@ void CpuExecutor::inverse_2d_integer(
         thread_local std::vector<float> normalized;
         thread_local std::vector<float> intermediate;
         thread_local std::vector<float> result;
-        normalized.resize(
-            static_cast<std::size_t>(vertical.source_size)
-            * static_cast<std::size_t>(normalized_stride));
-        intermediate.resize(
-            static_cast<std::size_t>(vertical.source_size)
-            * static_cast<std::size_t>(intermediate_stride));
-        result.resize(
-            static_cast<std::size_t>(vertical.destination_size)
-            * static_cast<std::size_t>(intermediate_stride));
+        normalized.resize(detail::checked_size_product(
+            static_cast<std::size_t>(vertical.source_size),
+            static_cast<std::size_t>(normalized_stride),
+            "CPU normalized input"));
+        intermediate.resize(detail::checked_size_product(
+            static_cast<std::size_t>(vertical.source_size),
+            static_cast<std::size_t>(intermediate_stride),
+            "CPU integer intermediate"));
+        result.resize(detail::checked_size_product(
+            static_cast<std::size_t>(vertical.destination_size),
+            static_cast<std::size_t>(intermediate_stride),
+            "CPU integer result"));
         if constexpr (std::is_same_v<Sample, std::uint8_t>) {
             normalize_u8_neon(
                 input, input_row_stride, normalized.data(), normalized_stride,
@@ -1816,20 +1929,25 @@ void CpuExecutor::inverse_2d_integer(
     }
 #endif
     const auto packed_vertical = impl_->get(vertical);
-    const auto padded_columns = (horizontal.destination_size + 7) & ~7;
+    const auto padded_columns = detail::checked_size_i32(
+        detail::checked_size_round_up(
+            static_cast<std::size_t>(horizontal.destination_size), 8U,
+            "CPU integer RHS"),
+        "CPU integer RHS");
     thread_local std::vector<float> rhs;
-    rhs.resize(static_cast<std::size_t>(vertical.destination_size)
-               * static_cast<std::size_t>(padded_columns));
+    rhs.resize(detail::checked_size_product(
+        static_cast<std::size_t>(vertical.destination_size),
+        static_cast<std::size_t>(padded_columns), "CPU integer RHS"));
     auto *rhs_data = rhs.data();
 
 #if defined(DSMVC_HAS_AVX2_OBJECT)
     if (path_ == CpuPath::avx2) {
         const auto packed_horizontal = impl_->get(horizontal);
-        if (vertical.source_size >= 8
-            && input_row_stride >= packed_horizontal->padded_source_size) {
-            const auto enough_work =
-                static_cast<std::size_t>(horizontal.destination_size)
-                    * static_cast<std::size_t>(vertical.source_size) >= 262144U;
+        if (vertical.source_size >= 8) {
+            const auto enough_work = detail::checked_size_product(
+                static_cast<std::size_t>(horizontal.destination_size),
+                static_cast<std::size_t>(vertical.source_size),
+                "CPU integer work") >= 262144U;
             const auto row_tasks = std::min<std::size_t>(
                 impl_->workers->parallelism(),
                 static_cast<std::size_t>(vertical.destination_size));
@@ -1987,17 +2105,22 @@ void CpuExecutor::inverse_2d_integer_streamed(
     }
 #endif
     const auto packed_vertical = impl_->get(vertical);
-    const auto padded_columns = (horizontal.destination_size + 7) & ~7;
+    const auto padded_columns = detail::checked_size_i32(
+        detail::checked_size_round_up(
+            static_cast<std::size_t>(horizontal.destination_size), 8U,
+            "CPU streamed integer RHS"),
+        "CPU streamed integer RHS");
     thread_local std::vector<float> rhs;
-    rhs.resize(static_cast<std::size_t>(vertical.destination_size)
-               * static_cast<std::size_t>(padded_columns));
+    rhs.resize(detail::checked_size_product(
+        static_cast<std::size_t>(vertical.destination_size),
+        static_cast<std::size_t>(padded_columns),
+        "CPU streamed integer RHS"));
     auto *rhs_data = rhs.data();
 
 #if defined(DSMVC_HAS_AVX2_OBJECT)
     if (path_ == CpuPath::avx2) {
         const auto packed_horizontal = impl_->get(horizontal);
-        if (vertical.source_size >= 8
-            && input_row_stride >= packed_horizontal->padded_source_size) {
+        if (vertical.source_size >= 8) {
             if constexpr (std::is_same_v<Sample, std::uint8_t>) {
                 forward_2d_rhs_u8_avx2(
                     horizontal, *packed_horizontal,

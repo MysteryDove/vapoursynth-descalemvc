@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cfloat>
 #include <cstdint>
 
 namespace kernel = dsmvc::cuda_kernel;
@@ -598,10 +599,13 @@ __device__ __forceinline__ void solve_axis_f64(
         const std::uint32_t available = minimum(plan.half_bandwidth, index);
         for (std::uint32_t distance = available;
              distance > 0U; --distance) {
-            value = __fma_rn(
-                -lower_factor_f64(
-                    precision, size, index, distance, lower_f32, bands_f64),
-                output[(index - distance) * output_stride], value);
+            value = __dsub_rn(
+                value,
+                __dmul_rn(
+                    lower_factor_f64(
+                        precision, size, index, distance,
+                        lower_f32, bands_f64),
+                    output[(index - distance) * output_stride]));
         }
         if (precision == kernel::PlanPrecision::float64) {
             output[index * output_stride] = value;
@@ -613,7 +617,8 @@ __device__ __forceinline__ void solve_axis_f64(
     if (precision == kernel::PlanPrecision::float64) {
         for (std::uint32_t index = 0U; index < size; ++index) {
             output[index * output_stride] = __ddiv_rn(
-                output[index * output_stride], bands_f64[index]);
+                output[index * output_stride],
+                __dadd_rn(bands_f64[index], DBL_EPSILON));
         }
     }
     if (size < 2U) return;
@@ -624,10 +629,13 @@ __device__ __forceinline__ void solve_axis_f64(
         double value = output[index * output_stride];
         for (std::uint32_t distance = available;
              distance > 0U; --distance) {
-            value = __fma_rn(
-                -upper_factor_f64(
-                    precision, size, index, distance, upper_f32, bands_f64),
-                output[(index + distance) * output_stride], value);
+            value = __dsub_rn(
+                value,
+                __dmul_rn(
+                    upper_factor_f64(
+                        precision, size, index, distance,
+                        upper_f32, bands_f64),
+                    output[(index + distance) * output_stride]));
         }
         output[index * output_stride] = value;
     }
@@ -656,10 +664,12 @@ __device__ __forceinline__ void inverse_axis_f64(
         for (std::uint32_t position = begin; position < end; ++position) {
             const auto source = static_cast<std::uint32_t>(
                 transpose_indices[position]);
-            value = __fma_rn(
-                plan_weight_f64(
-                    precision, position, weights_f32, weights_f64),
-                input[source * input_stride], value);
+            value = __dadd_rn(
+                value,
+                __dmul_rn(
+                    plan_weight_f64(
+                        precision, position, weights_f32, weights_f64),
+                    input[source * input_stride]));
         }
         output[index * output_stride] = value;
     }
@@ -689,10 +699,12 @@ __device__ __forceinline__ void rhs_axis_2d_f64(
     for (std::uint32_t position = begin; position < end; ++position) {
         const auto source = static_cast<std::uint32_t>(
             transpose_indices[position]);
-        value = __fma_rn(
-            plan_weight_f64(
-                precision, position, weights_f32, weights_f64),
-            input[source * vector_count + vector], value);
+        value = __dadd_rn(
+            value,
+            __dmul_rn(
+                plan_weight_f64(
+                    precision, position, weights_f32, weights_f64),
+                input[source * vector_count + vector]));
     }
     if constexpr (ColumnMajorOutput) {
         output[index * vector_count + vector] = value;
@@ -742,10 +754,19 @@ __device__ __forceinline__ void transpose_source_f64(
 
 template <class Sample>
 __device__ __forceinline__ Sample convert_output_f64(
-    double value, const kernel::IntegerConversionDescriptor &conversion) {
+    double value, const kernel::IntegerConversionDescriptor &conversion,
+    std::uint32_t *__restrict__ nonfinite) {
+    if (!isfinite(value)) {
+        atomicExch(nonfinite, 1U);
+        return Sample{};
+    }
     value = __dadd_rn(
         __dmul_rn(value, static_cast<double>(conversion.output_scale)),
         static_cast<double>(conversion.output_offset));
+    if (!isfinite(value)) {
+        atomicExch(nonfinite, 1U);
+        return Sample{};
+    }
     value = fmin(
         fmax(value, 0.0), static_cast<double>(conversion.output_maximum));
     return static_cast<Sample>(__double2uint_rn(value));
@@ -1142,10 +1163,18 @@ extern "C" __global__ void dsmvc_cuda_solve_vertical_f64(
 extern "C" __global__ void dsmvc_cuda_convert_f64_f32(
     const double *__restrict__ source,
     std::uint32_t element_count,
-    float *__restrict__ output) {
+    float *__restrict__ output,
+    std::uint32_t *__restrict__ nonfinite) {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < element_count) {
-        output[index] = static_cast<float>(source[index]);
+        const double value = source[index];
+        const float converted = static_cast<float>(value);
+        if (!isfinite(value) || !isfinite(converted)) {
+            atomicExch(nonfinite, 1U);
+            output[index] = 0.0F;
+        } else {
+            output[index] = converted;
+        }
     }
 }
 
@@ -1153,11 +1182,12 @@ extern "C" __global__ void dsmvc_cuda_convert_f64_u8(
     const double *__restrict__ source,
     std::uint32_t element_count,
     kernel::IntegerConversionDescriptor conversion,
-    std::uint8_t *__restrict__ output) {
+    std::uint8_t *__restrict__ output,
+    std::uint32_t *__restrict__ nonfinite) {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < element_count) {
         output[index] = convert_output_f64<std::uint8_t>(
-            source[index], conversion);
+            source[index], conversion, nonfinite);
     }
 }
 
@@ -1165,11 +1195,12 @@ extern "C" __global__ void dsmvc_cuda_convert_f64_u16(
     const double *__restrict__ source,
     std::uint32_t element_count,
     kernel::IntegerConversionDescriptor conversion,
-    std::uint16_t *__restrict__ output) {
+    std::uint16_t *__restrict__ output,
+    std::uint32_t *__restrict__ nonfinite) {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < element_count) {
         output[index] = convert_output_f64<std::uint16_t>(
-            source[index], conversion);
+            source[index], conversion, nonfinite);
     }
 }
 
@@ -1478,29 +1509,30 @@ cudaError_t convert(
 
 cudaError_t convert_f64(
     const double *source, std::uint32_t element_count,
-    float *output, cudaStream_t stream) {
+    float *output, std::uint32_t *nonfinite, cudaStream_t stream) {
     dsmvc_cuda_convert_f64_f32<<<divide_up(element_count, conversion_threads),
-        conversion_threads, 0U, stream>>>(source, element_count, output);
+        conversion_threads, 0U, stream>>>(
+            source, element_count, output, nonfinite);
     return launch_status();
 }
 
 cudaError_t convert_f64(
     const double *source, std::uint32_t element_count,
     cuda_kernel::IntegerConversionDescriptor conversion,
-    std::uint8_t *output, cudaStream_t stream) {
+    std::uint8_t *output, std::uint32_t *nonfinite, cudaStream_t stream) {
     dsmvc_cuda_convert_f64_u8<<<divide_up(element_count, conversion_threads),
         conversion_threads, 0U, stream>>>(
-        source, element_count, conversion, output);
+        source, element_count, conversion, output, nonfinite);
     return launch_status();
 }
 
 cudaError_t convert_f64(
     const double *source, std::uint32_t element_count,
     cuda_kernel::IntegerConversionDescriptor conversion,
-    std::uint16_t *output, cudaStream_t stream) {
+    std::uint16_t *output, std::uint32_t *nonfinite, cudaStream_t stream) {
     dsmvc_cuda_convert_f64_u16<<<divide_up(element_count, conversion_threads),
         conversion_threads, 0U, stream>>>(
-        source, element_count, conversion, output);
+        source, element_count, conversion, output, nonfinite);
     return launch_status();
 }
 

@@ -1,13 +1,16 @@
 #include <dsmvc/engine.hpp>
 
 #include "axis_plan_internal.hpp"
+#include "checked_size.hpp"
 #include "cpu_packed.hpp"
 
 #include <algorithm>
+#include <array>
 #include <arm_neon.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -59,17 +62,26 @@ struct F64Workspace {
 [[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_fma(
     F64Quad value, double coefficient, F64Quad source) noexcept {
     const auto weight = vdupq_n_f64(coefficient);
-    value.low = vfmaq_f64(value.low, source.low, weight);
-    value.high = vfmaq_f64(value.high, source.high, weight);
+    value.low = vaddq_f64(value.low, vmulq_f64(source.low, weight));
+    value.high = vaddq_f64(value.high, vmulq_f64(source.high, weight));
     return value;
 }
 
 [[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_fms(
     F64Quad value, double coefficient, F64Quad source) noexcept {
     const auto weight = vdupq_n_f64(coefficient);
-    value.low = vfmsq_f64(value.low, source.low, weight);
-    value.high = vfmsq_f64(value.high, source.high, weight);
+    value.low = vsubq_f64(value.low, vmulq_f64(source.low, weight));
+    value.high = vsubq_f64(value.high, vmulq_f64(source.high, weight));
     return value;
+}
+
+[[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_divide(
+    F64Quad value, double denominator) noexcept {
+    const auto divisor = vdupq_n_f64(denominator);
+    return {
+        vdivq_f64(value.low, divisor),
+        vdivq_f64(value.high, divisor),
+    };
 }
 
 [[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_multiply(
@@ -125,9 +137,10 @@ void solve_axis_f64_quad(
 
     if constexpr (RetainedFloat64) {
         for (std::int32_t i = 0; i < n; ++i) {
-            values[static_cast<std::size_t>(i)] = f64_quad_multiply(
+            values[static_cast<std::size_t>(i)] = f64_quad_divide(
                 values[static_cast<std::size_t>(i)],
-                plan.inverse_diagonal_f64[static_cast<std::size_t>(i)]);
+                plan.ldlt_bands_f64[static_cast<std::size_t>(i)]
+                    + std::numeric_limits<double>::epsilon());
         }
     }
 
@@ -363,12 +376,23 @@ DSMVC_FORCE_INLINE void transpose4(float32x4_t &row0, float32x4_t &row1,
 }
 
 void transpose_source(const float *input, std::ptrdiff_t stride,
+                      std::int32_t logical_width,
                       std::int32_t padded_width, float *scratch) noexcept {
     for (std::int32_t column = 0; column < padded_width; column += 4) {
-        float32x4_t x0 = vld1q_f32(input + column);
-        float32x4_t x1 = vld1q_f32(input + stride + column);
-        float32x4_t x2 = vld1q_f32(input + 2 * stride + column);
-        float32x4_t x3 = vld1q_f32(input + 3 * stride + column);
+        const auto remaining = std::clamp(logical_width - column, 0, 4);
+        const auto load_row = [&](std::int32_t row) noexcept {
+            if (remaining == 0) return vdupq_n_f32(0.0F);
+            const auto *source = input
+                + static_cast<std::ptrdiff_t>(row) * stride + column;
+            if (remaining == 4) return vld1q_f32(source);
+            std::array<float, 4> tail{};
+            std::copy_n(source, remaining, tail.data());
+            return vld1q_f32(tail.data());
+        };
+        float32x4_t x0 = load_row(0);
+        float32x4_t x1 = load_row(1);
+        float32x4_t x2 = load_row(2);
+        float32x4_t x3 = load_row(3);
         transpose4(x0, x1, x2, x3);
         vst1q_f32(scratch + static_cast<std::size_t>(column + 0) * 4U, x0);
         vst1q_f32(scratch + static_cast<std::size_t>(column + 1) * 4U, x1);
@@ -873,7 +897,9 @@ void solve_horizontal_block(const AxisPlan &plan,
                             const float *input, std::ptrdiff_t input_stride,
                             float *output, std::ptrdiff_t output_stride,
                             float *scratch) noexcept {
-    transpose_source(input, input_stride, packed.padded_source_size, scratch);
+    transpose_source(
+        input, input_stride, plan.source_size,
+        packed.padded_source_size, scratch);
     if (plan.half_bandwidth == 1) {
         solve_horizontal_b1(packed, scratch, output, output_stride);
     } else if (plan.half_bandwidth == 3) {
@@ -899,10 +925,11 @@ void solve_horizontal_b3_pair_block(
         packed.padded_source_size) * 4U;
     auto *scratch_second = scratch + scratch_stride;
     transpose_source(
-        input, input_stride, packed.padded_source_size, scratch);
+        input, input_stride, packed.axis->source_size,
+        packed.padded_source_size, scratch);
     transpose_source(
         input + 4 * input_stride, input_stride,
-        packed.padded_source_size, scratch_second);
+        packed.axis->source_size, packed.padded_source_size, scratch_second);
     solve_horizontal_b3_pair(
         packed, scratch, scratch_second, output, output_stride);
 }
@@ -1770,12 +1797,14 @@ void forward_2d_integer_rhs(
     thread_local std::vector<std::int32_t> cache_rows;
     thread_local std::vector<std::uint64_t> cache_ages;
     thread_local std::vector<const float *> source_rows;
-    normalized_block.resize(
-        4U * static_cast<std::size_t>(packed_horizontal.padded_source_size));
+    normalized_block.resize(detail::checked_size_product(
+        4U, static_cast<std::size_t>(packed_horizontal.padded_source_size),
+        "NEON normalized block"));
     transpose_scratch.resize(
         static_cast<std::size_t>(packed_horizontal.padded_source_size));
-    horizontal_cache.resize(
-        cache_blocks * static_cast<std::size_t>(padded_columns));
+    horizontal_cache.resize(detail::checked_size_product(
+        cache_blocks, static_cast<std::size_t>(padded_columns),
+        "NEON horizontal cache"));
     cache_rows.assign(cache_blocks, -1);
     cache_ages.assign(cache_blocks, 0U);
     auto *transpose_data = transpose_scratch.front().lanes;
@@ -2014,9 +2043,9 @@ void inverse_2d_integer_neon(
     const IntegerConversion &conversion) {
     const auto stride = packed_horizontal.padded_destination_size;
     thread_local std::vector<float> rhs;
-    rhs.resize(
-        static_cast<std::size_t>(vertical.destination_size)
-        * static_cast<std::size_t>(stride));
+    rhs.resize(detail::checked_size_product(
+        static_cast<std::size_t>(vertical.destination_size),
+        static_cast<std::size_t>(stride), "NEON integer RHS"));
     forward_2d_integer_rhs(
         horizontal, packed_horizontal, vertical, packed_vertical,
         input, input_row_stride, conversion, rhs.data(), stride);
@@ -2074,9 +2103,7 @@ void inverse_rows_neon(const AxisPlan &plan,
                        const float *input, std::ptrdiff_t input_row_stride,
                        float *output, std::ptrdiff_t output_row_stride,
                        std::int32_t row_count) {
-    if (row_count < 4
-        || input_row_stride < packed.padded_source_size
-        || output_row_stride < packed.padded_destination_size) {
+    if (row_count < 4) {
         for (std::int32_t row = 0; row < row_count; ++row) {
             detail::inverse_axis_f32_ordered(
                 plan,
@@ -2088,12 +2115,45 @@ void inverse_rows_neon(const AxisPlan &plan,
     }
 
     const auto complete_rows = row_count & ~3;
-    const bool pair_b3 = plan.half_bandwidth == 3 && complete_rows >= 8;
+    const bool use_output_scratch =
+        plan.destination_size != packed.padded_destination_size;
+    const bool pair_b3 = plan.half_bandwidth == 3 && complete_rows >= 8
+        && !use_output_scratch;
     const auto scratch_blocks = pair_b3 ? 2U : 1U;
     thread_local std::vector<ScratchVector> scratch;
-    scratch.resize(
-        static_cast<std::size_t>(packed.padded_source_size) * scratch_blocks);
+    scratch.resize(detail::checked_size_product(
+        static_cast<std::size_t>(packed.padded_source_size), scratch_blocks,
+        "NEON row scratch"));
     auto *scratch_data = scratch.front().lanes;
+    thread_local std::vector<ScratchVector> padded_output;
+    if (use_output_scratch) {
+        padded_output.resize(
+            static_cast<std::size_t>(packed.padded_destination_size));
+    }
+    const auto solve_block = [&](std::int32_t block_row) {
+        auto *block_output = use_output_scratch
+            ? padded_output.front().lanes
+            : output + static_cast<std::ptrdiff_t>(block_row)
+                * output_row_stride;
+        const auto block_output_stride = use_output_scratch
+            ? static_cast<std::ptrdiff_t>(packed.padded_destination_size)
+            : output_row_stride;
+        solve_horizontal_block(
+            plan, packed,
+            input + static_cast<std::ptrdiff_t>(block_row) * input_row_stride,
+            input_row_stride, block_output, block_output_stride, scratch_data);
+        if (use_output_scratch) {
+            for (std::int32_t lane = 0; lane < 4; ++lane) {
+                std::copy_n(
+                    block_output
+                        + static_cast<std::ptrdiff_t>(lane)
+                            * block_output_stride,
+                    plan.destination_size,
+                    output + static_cast<std::ptrdiff_t>(block_row + lane)
+                        * output_row_stride);
+            }
+        }
+    };
     std::int32_t row = 0;
     if (pair_b3) {
         const auto paired_rows = complete_rows & ~7;
@@ -2107,21 +2167,10 @@ void inverse_rows_neon(const AxisPlan &plan,
         }
     }
     for (; row < complete_rows; row += 4) {
-        solve_horizontal_block(
-            plan, packed,
-            input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
-            input_row_stride,
-            output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
-            output_row_stride, scratch_data);
+        solve_block(row);
     }
     if (complete_rows != row_count) {
-        const auto row = row_count - 4;
-        solve_horizontal_block(
-            plan, packed,
-            input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
-            input_row_stride,
-            output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
-            output_row_stride, scratch_data);
+        solve_block(row_count - 4);
     }
 }
 
@@ -2130,10 +2179,7 @@ void inverse_columns_neon(const AxisPlan &plan,
                           const float *input, std::ptrdiff_t input_row_stride,
                           float *output, std::ptrdiff_t output_row_stride,
                           std::int32_t column_count) {
-    const auto padded_columns = (column_count + 3) & ~3;
-    const auto vector_columns = input_row_stride >= padded_columns
-            && output_row_stride >= padded_columns
-        ? padded_columns : (column_count & ~3);
+    const auto vector_columns = column_count & ~3;
     if (plan.half_bandwidth == 1) {
         solve_columns_b1(plan, packed, input, input_row_stride, output,
                          output_row_stride, vector_columns);

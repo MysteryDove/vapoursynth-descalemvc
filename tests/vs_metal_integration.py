@@ -273,9 +273,10 @@ def test_conditioned_float64_fallback(core: vs.Core) -> None:
 
 
 def patterned_general_source(core: vs.Core, format_id: int,
-                             length: int = 16) -> vs.VideoNode:
+                             length: int = 16, *, width: int = 128,
+                             height: int = 96) -> vs.VideoNode:
     blank = core.std.BlankClip(
-        width=128, height=96, length=1, format=format_id)
+        width=width, height=height, length=1, format=format_id)
 
     def make(seed: int, range_value: int) -> vs.VideoNode:
         def fill(n: int, f: vs.VideoFrame) -> vs.VideoFrame:
@@ -350,6 +351,19 @@ def test_general_surface(core: vs.Core, threads: int) -> None:
             source, backend="metal", border_handling=1, **geometry)
         compare_general_clips(
             core, cpu, metal, f"general/{source.format.name}", threads)
+
+    reproduced_source = patterned_general_source(
+        core, vs.GRAY16, width=96, height=64)
+    reproduced_geometry = {"width": 80, "height": 48}
+    compare_general_clips(
+        core,
+        core.dsmvc.Debicubic(
+            reproduced_source, backend="cpu", opt=1, f64mode=1,
+            **reproduced_geometry),
+        core.dsmvc.Debicubic(
+            reproduced_source, backend="metal", f64mode=1,
+            **reproduced_geometry),
+        "integer-contract/GRAY16-96x64-to-80x48", threads)
 
     vertical_source = patterned_general_source(core, vs.YUV444PS)
     compare_general_clips(
@@ -563,11 +577,29 @@ def test_grays_b1_metal(core: vs.Core, threads: int) -> None:
     del explicit_frames, explicit_source
     gc.collect()
 
-    auto_source = patterned_grays_source(core, 64)
-    auto_frame = filtered(auto_source, "bilinear", "auto").get_frame(0)
+    wide_auto_source = patterned_grays_source(core, 64)
+    wide_cpu_reference = filtered(
+        wide_auto_source, "spline64", "cpu").get_frame(0)
+    wide_auto_frames = collect(
+        filtered(wide_auto_source, "spline64", "auto"), threads)
+    for frame in wide_auto_frames:
+        maximum = max(maximum, compare_grays(
+            wide_cpu_reference, frame, "GRAYS/B7/automatic"))
+    wide_assigned, _ranges = metal_assignments(
+        wide_auto_frames, 7, "GRAYS/B7/automatic", track_range=False,
+        copies_per_frame=2)
+    require(wide_assigned > 0,
+            "eligible GRAYS automatic route never activated Metal")
+    del wide_auto_frames, wide_cpu_reference, wide_auto_source
+    gc.collect()
+
+    narrow_auto_source = patterned_grays_source(core, 64)
+    auto_frame = filtered(narrow_auto_source, "bilinear", "auto").get_frame(0)
     require(int(auto_frame.props.get("_DSMVCMetal", -1)) == 0,
             "GRAYS B1 auto route bypassed its measured CPU fallback")
-    print(f"GRAYS/B1 explicit Metal: max_error={maximum}")
+    del auto_frame, narrow_auto_source
+    gc.collect()
+    print(f"GRAYS explicit/automatic Metal: max_error={maximum}")
 
 
 def run(options: argparse.Namespace) -> None:
@@ -599,11 +631,14 @@ def run(options: argparse.Namespace) -> None:
     require(cpu_error <= 1.5e-6,
             f"CPU scalar/native SIMD mismatch: {cpu_error}")
     test_precision_and_padding_arguments(core, cpu_source)
-    for backend in ("vulkan", "cuda"):
-        expect_error(
-            lambda backend=backend: core.dsmvc.Debicubic(
-                cpu_source, width=80, height=48, backend=backend),
-            "not compiled")
+    for backend, enabled in (
+            ("vulkan", options.vulkan_enabled),
+            ("cuda", options.cuda_enabled)):
+        if not enabled:
+            expect_error(
+                lambda backend=backend: core.dsmvc.Debicubic(
+                    cpu_source, width=80, height=48, backend=backend),
+                "not compiled")
 
     if options.expect_metal == "disabled":
         expect_error(
@@ -681,6 +716,8 @@ def parser() -> argparse.ArgumentParser:
         "--expect-metal", choices=("enabled", "disabled"),
         default="enabled")
     result.add_argument("--conditioned-only", action="store_true")
+    result.add_argument("--cuda-enabled", action="store_true")
+    result.add_argument("--vulkan-enabled", action="store_true")
     return result
 
 

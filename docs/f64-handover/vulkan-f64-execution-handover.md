@@ -1,5 +1,9 @@
 # Vulkan Float64 Execution Handover
 
+> Status: capability-gated native retained-F64 Vulkan execution is
+> implemented. The staged sections below are retained as design history; the
+> arithmetic and acceptance contracts describe the current implementation.
+
 ## Goal
 
 Add native Vulkan Double execution on devices that explicitly expose the
@@ -114,11 +118,12 @@ flush/invalidate alignment.
 
 ### Arithmetic and traversal
 
-Vulkan work starts only after the integrator lands the shared explicit-FMA F64
-oracle. Match its operation order and raw-band indexing. Use explicit FMA and
-the required SPIR-V float controls/decorations rather than relying on implicit
-contraction. Inspect generated SPIR-V instead of assuming source qualifiers
-survived compilation.
+The scalar CPU path is the arithmetic oracle. Match its separately rounded
+multiply and add/subtract order and its raw-band indexing. The current shader
+uses `precise` operations with `NoContraction`; retained diagonal division uses
+a reciprocal plus residual correction because the supported NVIDIA toolchain
+fails to compile the direct FP64 `OpFDiv` form. Inspect generated SPIR-V instead
+of assuming source qualifiers survived compilation.
 
 For 2D, once either axis is risky, transpose/normalize to Double, execute both
 axes in Double, and convert only after the final solve. A safe companion axis
@@ -229,8 +234,9 @@ correct native Vulkan Float64 fallback on the same physical device. Follow
 
 Native Vulkan F64 final float output should be identical to scalar CPU output
 or within one output ULP with no high-precision-oracle regression. Integer
-output is bit exact. Any NaN, infinity, validation-layer error, or device loss
-fails admission.
+output is within one code of scalar CPU F64. Repeated execution on the same
+Vulkan route remains bit exact. Any NaN, infinity, validation-layer error, or
+device loss fails admission.
 
 ## Explicit Backend Semantics
 
@@ -250,7 +256,7 @@ Stop without shared integration if:
 - retained plans use widened F32 coefficients;
 - precision is missing from a plan, pipeline, descriptor, or command cache key;
 - a 2D intermediate is Float32;
-- integer output differs;
+- integer output differs from scalar CPU F64 by more than one code;
 - SPIR-V inspection does not prove the intended Float64 operations; or
 - explicit Vulkan can silently execute on CPU.
 

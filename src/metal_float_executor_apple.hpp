@@ -9,8 +9,6 @@
 
 namespace dsmvc::experimental {
 
-[[nodiscard]] bool apple_m_series_metal_available() noexcept;
-
 struct MetalFloatFrame {
     const float *source = nullptr;
     std::ptrdiff_t source_stride_bytes = 0;

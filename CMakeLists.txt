@@ -24,6 +24,8 @@ set(DSMVC_CUDA_ARCHITECTURES
 set(DSMVC_CUDA_PTX_ARCHITECTURES "75;120" CACHE STRING
     "Virtual compute targets embedded as CUDA PTX fallbacks")
 option(DSMVC_BUILD_BENCHMARKS "Build CPU and numerical contract benchmarks" OFF)
+option(DSMVC_ENABLE_NATIVE_CPU_SIMD
+       "Build the native AVX2 or NEON CPU implementation" ON)
 
 set(DSMVC_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
 if(APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -86,10 +88,14 @@ set(DSMVC_ENGINE_SOURCES
 
 set(DSMVC_CAN_BUILD_AVX2 OFF)
 set(DSMVC_CAN_BUILD_NEON OFF)
-if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND DSMVC_TARGET_PROCESSOR MATCHES "^(amd64|x86_64)$")
+if(DSMVC_ENABLE_NATIVE_CPU_SIMD
+   AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND DSMVC_TARGET_PROCESSOR MATCHES "^(amd64|x86_64)$")
     set(DSMVC_CAN_BUILD_AVX2 ON)
     list(APPEND DSMVC_ENGINE_SOURCES src/cpu_executor_avx2.cpp)
-elseif(CMAKE_SIZEOF_VOID_P EQUAL 8 AND DSMVC_TARGET_PROCESSOR MATCHES "^(arm64|aarch64)$")
+elseif(DSMVC_ENABLE_NATIVE_CPU_SIMD
+       AND CMAKE_SIZEOF_VOID_P EQUAL 8
+       AND DSMVC_TARGET_PROCESSOR MATCHES "^(arm64|aarch64)$")
     set(DSMVC_CAN_BUILD_NEON ON)
     list(APPEND DSMVC_ENGINE_SOURCES src/cpu_executor_neon.cpp)
 endif()
@@ -266,7 +272,7 @@ if(DSMVC_CAN_BUILD_AVX2)
     target_compile_definitions(dsmvc_engine PRIVATE DSMVC_HAS_AVX2_OBJECT=1)
     if(MSVC)
         set_source_files_properties(src/cpu_executor_avx2.cpp PROPERTIES
-            COMPILE_OPTIONS "/arch:AVX2;/Ob3;/fp:fast")
+            COMPILE_OPTIONS "/arch:AVX2;/Ob3;/fp:strict")
     else()
         set_source_files_properties(src/cpu_executor_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
     endif()
@@ -321,10 +327,38 @@ if(BUILD_TESTING)
     target_link_libraries(dsmvc_engine_tests PRIVATE dsmvc_engine)
     add_test(NAME dsmvc_engine_tests COMMAND dsmvc_engine_tests)
 
+    add_executable(dsmvc_simd_buffer_contract_tests
+        tests/simd_buffer_contract_tests.cpp)
+    target_compile_features(dsmvc_simd_buffer_contract_tests PRIVATE cxx_std_23)
+    target_include_directories(dsmvc_simd_buffer_contract_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(dsmvc_simd_buffer_contract_tests PRIVATE dsmvc_engine)
+    if(MSVC)
+        target_compile_options(dsmvc_simd_buffer_contract_tests PRIVATE
+            /W4 /permissive- /EHsc /fp:strict /Zc:__cplusplus)
+        target_compile_definitions(dsmvc_simd_buffer_contract_tests PRIVATE
+            _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    else()
+        target_compile_options(dsmvc_simd_buffer_contract_tests PRIVATE
+            -Wall -Wextra -Wpedantic -ffp-contract=off)
+    endif()
+    add_test(NAME dsmvc_simd_buffer_contract_tests
+        COMMAND dsmvc_simd_buffer_contract_tests)
+
     dsmvc_add_numerical_contract_test(
         dsmvc_numerical_contract_tests
         BACKEND shared
         SOURCES tests/numerical_contract_tests.cpp)
+
+    dsmvc_add_numerical_contract_test(
+        dsmvc_f64_contract_tests
+        BACKEND shared
+        SOURCES tests/f64_contract_tests.cpp)
+
+    dsmvc_add_numerical_contract_test(
+        dsmvc_integer_contract_tests
+        BACKEND shared
+        SOURCES tests/integer_contract_tests.cpp)
 
     if(DSMVC_ENABLE_CUDA)
         add_test(NAME dsmvc_cuda_artifact_inventory
@@ -436,13 +470,21 @@ if(BUILD_TESTING)
         )
         set_tests_properties(dsmvc_vs_integration PROPERTIES TIMEOUT 60)
     endif()
+    set(_dsmvc_vs_backend_args)
+    if(DSMVC_ENABLE_CUDA)
+        list(APPEND _dsmvc_vs_backend_args --cuda-enabled)
+    endif()
+    if(DSMVC_ENABLE_VULKAN)
+        list(APPEND _dsmvc_vs_backend_args --vulkan-enabled)
+    endif()
     if(DSMVC_VS_PYTHON AND NOT DSMVC_ENABLE_METAL)
         add_test(
             NAME dsmvc_vs_api4_smoke
             COMMAND "${DSMVC_VS_PYTHON}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/vs_metal_integration.py"
                 --plugin "$<TARGET_FILE:dsmvc>"
-                --expect-metal disabled)
+                --expect-metal disabled
+                ${_dsmvc_vs_backend_args})
         set_tests_properties(dsmvc_vs_api4_smoke PROPERTIES TIMEOUT 60)
     endif()
     if(DSMVC_ENABLE_METAL AND DSMVC_VS_PYTHON)
@@ -452,6 +494,7 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/vs_metal_integration.py"
                 --plugin "$<TARGET_FILE:dsmvc>"
                 --expect-metal enabled
+                ${_dsmvc_vs_backend_args}
                 --conditioned-only)
         set_tests_properties(dsmvc_vs_conditioned_float64_metal PROPERTIES
             TIMEOUT 60
@@ -461,7 +504,8 @@ if(BUILD_TESTING)
             COMMAND "${DSMVC_VS_PYTHON}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/vs_metal_integration.py"
                 --plugin "$<TARGET_FILE:dsmvc>"
-                --expect-metal enabled)
+                --expect-metal enabled
+                ${_dsmvc_vs_backend_args})
         set_tests_properties(dsmvc_vs_metal_integration PROPERTIES
             TIMEOUT 300
             RESOURCE_LOCK dsmvc_metal_device)
@@ -691,6 +735,7 @@ if(DSMVC_ENABLE_METAL)
             SOURCES
                 tests/metal_numerical_contract_tests.mm
                 src/metal_float_executor_apple.mm
+                src/metal_yuv_executor_apple.mm
                 "${DSMVC_METALLIB_HEADER}"
             LIBRARIES
                 "${DSMVC_METAL_FRAMEWORK}"
@@ -698,7 +743,7 @@ if(DSMVC_ENABLE_METAL)
             INCLUDE_DIRECTORIES
                 "${DSMVC_METAL_GENERATED_DIR}")
         set_source_files_properties(
-            src/metal_float_executor_apple.mm
+            src/metal_float_executor_apple.mm src/metal_yuv_executor_apple.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         set_tests_properties(
             dsmvc_metal_numerical_contract_tests PROPERTIES

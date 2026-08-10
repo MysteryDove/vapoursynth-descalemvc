@@ -130,14 +130,14 @@ namespace dsmvc::cuda_detail::cuda_launch {
     std::uint16_t *output, cudaStream_t stream);
 [[nodiscard]] cudaError_t convert_f64(
     const double *source, std::uint32_t element_count,
-    float *output, cudaStream_t stream);
+    float *output, std::uint32_t *nonfinite, cudaStream_t stream);
 [[nodiscard]] cudaError_t convert_f64(
     const double *source, std::uint32_t element_count,
     cuda_kernel::IntegerConversionDescriptor conversion,
-    std::uint8_t *output, cudaStream_t stream);
+    std::uint8_t *output, std::uint32_t *nonfinite, cudaStream_t stream);
 [[nodiscard]] cudaError_t convert_f64(
     const double *source, std::uint32_t element_count,
     cuda_kernel::IntegerConversionDescriptor conversion,
-    std::uint16_t *output, cudaStream_t stream);
+    std::uint16_t *output, std::uint32_t *nonfinite, cudaStream_t stream);
 
 } // namespace dsmvc::cuda_detail::cuda_launch

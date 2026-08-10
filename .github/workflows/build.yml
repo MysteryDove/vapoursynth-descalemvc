@@ -23,21 +23,38 @@ jobs:
           - os: windows-2022
             artifact: dsmvc-windows-x64
             cmake-architecture: -A x64
+            enable-cpu-simd: true
             enable-cuda: true
             enable-vulkan: true
             cuda-subpackages: '["nvcc", "nvvm", "cuobjdump", "cudart", "crt", "nvtx", "visual_studio_integration"]'
           - os: macos-15
             artifact: dsmvc-macos-arm64
             cmake-architecture: -DCMAKE_OSX_ARCHITECTURES=arm64
+            enable-cpu-simd: true
+            enable-cuda: false
+            enable-vulkan: false
+            cuda-subpackages: '[]'
+          - os: macos-15
+            artifact: dsmvc-macos-arm64-scalar
+            cmake-architecture: -DCMAKE_OSX_ARCHITECTURES=arm64
+            enable-cpu-simd: false
             enable-cuda: false
             enable-vulkan: false
             cuda-subpackages: '[]'
           - os: ubuntu-24.04
             artifact: dsmvc-linux-x64
             cmake-architecture: ""
+            enable-cpu-simd: true
             enable-cuda: true
             enable-vulkan: true
             cuda-subpackages: '["nvcc", "cuobjdump", "cudart", "crt", "nvtx"]'
+          - os: ubuntu-24.04
+            artifact: dsmvc-linux-x64-scalar
+            cmake-architecture: ""
+            enable-cpu-simd: false
+            enable-cuda: false
+            enable-vulkan: false
+            cuda-subpackages: '[]'
 
     steps:
       - name: Check out dsmvc
@@ -100,6 +117,7 @@ jobs:
           ${{ matrix.cmake-architecture }}
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=ON
+          -DDSMVC_ENABLE_NATIVE_CPU_SIMD=${{ matrix.enable-cpu-simd }}
           -DDSMVC_ENABLE_CUDA=${{ matrix.enable-cuda }}
           -DDSMVC_ENABLE_VULKAN=${{ matrix.enable-vulkan }}
           -DDSMVC_ENABLE_METAL=OFF

@@ -103,18 +103,6 @@ void copy_strided_rows(
 
 } // namespace
 
-bool apple_m_series_metal_available() noexcept {
-    static const bool available = []() noexcept {
-        @autoreleasepool {
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            return device != nil && device.hasUnifiedMemory
-                && device.name != nil
-                && [device.name hasPrefix:@"Apple M"];
-        }
-    }();
-    return available;
-}
-
 struct MetalFloatExecutor::Impl {
     Impl(std::shared_ptr<const AxisPlan> requested_horizontal,
          std::shared_ptr<const AxisPlan> requested_vertical,
@@ -223,7 +211,9 @@ struct MetalFloatExecutor::Impl {
     template <class Value>
     [[nodiscard]] id<MTLBuffer> make_plan_buffer(
         const std::vector<Value> &values, NSString *label) {
-        if (values.empty()) throw std::invalid_argument("Metal plan buffer is empty");
+        if (values.empty()) {
+            return make_empty_buffer(sizeof(std::uint32_t), label);
+        }
         const std::size_t bytes = values.size() * sizeof(Value);
         id<MTLBuffer> buffer = [device newBufferWithBytes:values.data()
                                                   length:bytes

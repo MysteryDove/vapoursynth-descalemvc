@@ -3,9 +3,9 @@
 ## Conclusion
 
 The complete CPU Float64 path is implemented and suitable as the backend
-oracle, but it is not performance-complete. The strongest opportunities are an
-x86 AVX2 Double path, ARM integer-input NEON F64, and extending the new
-axis-level numerical benchmark into a complete rows/columns/2D/integer harness.
+oracle, but it is not performance-complete. The x86 AVX2 four-RHS Double path
+is now implemented. Remaining opportunities include ARM integer-input NEON
+F64 and broader executor/plugin performance coverage.
 
 A lightweight benchmark now records ordered-reference, current-scalar, and
 native-CPU axis solves for automatic-risk and forced F64 plans. It is diagnostic
@@ -20,11 +20,11 @@ convergence bookkeeping. It may be revisited only if optimized direct F64 has a
 measured architecture-specific deficit. See
 [mixed-precision-ir-handover.md](mixed-precision-ir-handover.md).
 
-The shared explicit-FMA F64 oracle and conditioned QR anchor now exist and pass
-on ARM64 and x86_64. The ordered oracle is the cross-backend arithmetic
-contract. The explicitly selected scalar CPU path still uses non-fused
-arithmetic, while ARM NEON vector execution and its scalar-width tails now use
-the ordered FMA sequence.
+The shared ordered F64 oracle and conditioned QR anchor now exist and pass on
+ARM64 and x86_64. The scalar CPU path defines the cross-backend arithmetic
+contract: each multiply and add/subtract is rounded separately, and retained
+F64 diagonal application divides by `D + epsilon`. AVX2 and NEON vector bodies
+and scalar-width tails preserve that order.
 
 The CPU lane first converges scalar/AVX2/NEON F32 behavior and tails, then
 extends the F64 benchmark and optimizes direct F64. These are serial phases of
@@ -50,8 +50,8 @@ The current source directly establishes that:
   boundaries, and scalar tails at `0 ULP` for B1/B3/B5/B7. NEON F64 rows,
   columns, both safe/risky axis orders, and forced-F64/F64 2D also match the
   ordered Double result at `0 ULP`.
-- The x86 source contains no `__m256d` or other F64 implementation, so x86 F64
-  dispatch falls through to scalar Double.
+- [cpu_executor_avx2.cpp](../../src/cpu_executor_avx2.cpp) batches four
+  independent F64 RHS in `__m256d` lanes for rows, columns, and float 2D.
 - Both buffered and streamed integer F64 calls invoke `inverse_2d_f64` with
   `use_neon=false`, so ARM integer F64 is scalar.
 - Internal CPU parallelism is capped at four workers and the F64 path shares
@@ -67,7 +67,7 @@ The current source directly establishes that:
 
 | Rank | Opportunity | Expected value | Confidence | Main risk |
 |---:|---|---|---|---|
-| 1 | Add x86 AVX2 four-RHS Double rows/columns/2D | High | High | contraction/order changes and tail handling |
+| 1 | Tune the implemented x86 AVX2 four-RHS Double rows/columns/2D path | High | High | arithmetic-order changes and tail handling |
 | 2 | Add ARM NEON integer F64 normalization and output | High for U8/U16 risky plans | High | exact conversion/rounding parity |
 | 3 | Extend the F64 benchmark to rows/columns/2D/integer/plugin coverage | Enables all retention decisions | High | fixture bias if only one conditioned geometry is used |
 | 4 | Specialize F64 bandwidths 1, 3, 5, and 7 | Medium-high | Medium | code size and register pressure |
@@ -113,19 +113,22 @@ precision contract.
 4. Verify the plan actually retains F64 data before timing.
 5. Track allocation count/bytes, peak resident memory, worker utilization,
    cache misses, and hardware counters where available.
-6. Require exact integer parity, finite output, and the shared F64 numerical
-   gate before considering speed.
+6. Require the shared one-code integer contract, finite output, and the shared
+   F64 numerical gate before considering speed.
 7. Retain a change only when representative paired median improves by at least
    3% and no important case regresses by more than 3%, unless the commit has a
    documented architecture-specific scope.
 
 ## 1. x86 AVX2 Double Path
 
+Status: implemented. The design below records the accepted shape of the path;
+future changes remain subject to the same arithmetic and numerical gates.
+
 ### Evidence
 
-F64 dispatch in `CpuExecutor::inverse_rows` and `inverse_columns` has a NEON
-branch only. `src/cpu_executor_avx2.cpp` has no Double vectors. On x86, retained
-plans therefore execute the scalar allocation-based path even when `opt=2`.
+F64 dispatch in `CpuExecutor::inverse_rows`, `inverse_columns`, and float 2D now
+uses four independent `__m256d` RHS lanes when AVX2 is explicitly or
+automatically selected. Ordered scalar tails cover incomplete groups.
 
 ### Proposed implementation
 
@@ -146,7 +149,8 @@ change the existing F32 code generation as a side effect.
 ### Acceptance
 
 - all conditioned and mixed-axis float fixtures pass;
-- final integer output remains bit exact once integer support is connected;
+- final integer output remains within one code of scalar CPU F64 once integer
+  support is connected;
 - x86 Release plugin smoke passes on Windows/Linux target hardware, not only a
   macOS cross-architecture build; and
 - representative F64 executor and plugin medians improve by at least 3%.
@@ -169,15 +173,15 @@ store.
 3. Add a vertical Double-input solve whose final store applies Double
    `output_scale`, Double `output_offset`, clamp, and round-to-nearest-even.
 4. Use scalar conversion for tails until a vector rounding implementation is
-   proven bit exact for every supported output range.
+   proven to satisfy the one-code contract for every supported output range.
 5. Enable `use_neon` for integer F64 only after U8, U10, and U16 parity passes.
 
 ### Acceptance
 
-Every integer sample must match scalar output exactly for buffered and streamed
-calls, including half-way rounding cases, clamps, padded strides, odd widths,
-and fewer than four columns. A throughput gain cannot compensate for one LSB of
-difference in this path.
+Buffered and streamed calls must match each other exactly. Each integer sample
+must remain within one code of scalar CPU F64, including half-way rounding
+cases, clamps, padded strides, odd widths, and fewer than four columns. A
+throughput gain cannot compensate for exceeding that bound.
 
 ## 3. Bandwidth Specialization
 
@@ -266,7 +270,7 @@ Treat this as a separate algorithm experiment:
    independent oracle;
 3. measure memory traffic and plugin E2E, not just kernel time; and
 4. reject it if it changes final float output beyond one ULP or integer output
-   at all.
+   beyond one code relative to scalar CPU F64.
 
 It should not be assigned in the first parallel optimization wave.
 

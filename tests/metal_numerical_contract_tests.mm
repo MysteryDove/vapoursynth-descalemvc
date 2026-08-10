@@ -1,4 +1,5 @@
 #include "metal_float_executor_apple.hpp"
+#include "metal_yuv_executor_apple.hpp"
 #include "numerical_conformance.hpp"
 
 #import <Metal/Metal.h>
@@ -43,6 +44,20 @@ void require(bool condition, std::string message) {
     require(plan->valid() && !plan->requires_float64()
                 && plan->half_bandwidth == 9,
             "Metal generic plan is invalid");
+    return plan;
+}
+
+[[nodiscard]] std::shared_ptr<const dsmvc::AxisPlan>
+make_single_destination_plan() {
+    auto request = dsmvc::numerical::make_axis_request(
+        5, 1, 1.0, 0.0, dsmvc::KernelKind::bilinear, 0,
+        dsmvc::BorderMode::symmetric, dsmvc::F64Mode::float32_only);
+    auto plan = std::make_shared<const dsmvc::AxisPlan>(
+        dsmvc::build_axis_plan(request));
+    require(plan->valid() && !plan->requires_float64()
+                && plan->half_bandwidth == 0
+                && plan->lower_ld.empty() && plan->upper_l.empty(),
+            "Metal destination-size-one plan is invalid");
     return plan;
 }
 
@@ -137,6 +152,15 @@ void check_float64_rejection(
         rejected = true;
     }
     require(rejected, "direct Metal executor accepted an F64 plan");
+
+    rejected = false;
+    try {
+        dsmvc::experimental::MetalYuvExecutor executor(
+            {retained, identity}, {identity, identity}, 1U, 1U);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    require(rejected, "experimental Metal YUV executor accepted an F64 plan");
 }
 
 } // namespace
@@ -171,6 +195,10 @@ int main() {
             "generic-b9/horizontal", generic, identity, 0x9e110001U);
         check_metal_route(
             "generic-b9/vertical", identity, generic, 0x9e110002U);
+        const auto single_destination = make_single_destination_plan();
+        check_metal_route(
+            "destination-size-one", single_destination, single_destination,
+            0xd3510001U);
         check_float64_rejection(identity);
         std::cout << "dsmvc Metal numerical contract tests passed\n";
         return EXIT_SUCCESS;

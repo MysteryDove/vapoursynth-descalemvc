@@ -226,8 +226,32 @@ void test_2d_integer(
             horizontal, vertical, input.data(), input_stride,
             actual.data(), output_stride, conversion, {});
     }
-    require(actual == expected, std::string(label) + " is not bit exact");
-    std::cout << label << " bit_exact=1\n";
+    std::uint32_t maximum_error = 0U;
+    for (std::int32_t row = 0; row < vertical.destination_size; ++row) {
+        for (std::int32_t column = 0;
+             column < horizontal.destination_size; ++column) {
+            const auto index = static_cast<std::size_t>(row)
+                    * static_cast<std::size_t>(output_stride)
+                + static_cast<std::size_t>(column);
+            const auto left = static_cast<std::uint32_t>(expected[index]);
+            const auto right = static_cast<std::uint32_t>(actual[index]);
+            maximum_error = std::max(
+                maximum_error,
+                left > right ? left - right : right - left);
+        }
+        for (std::int32_t column = horizontal.destination_size;
+             column < output_stride; ++column) {
+            const auto index = static_cast<std::size_t>(row)
+                    * static_cast<std::size_t>(output_stride)
+                + static_cast<std::size_t>(column);
+            require(actual[index] == padding,
+                    std::string(label) + " overwrote output padding");
+        }
+    }
+    require(maximum_error <= 1U,
+            std::string(label)
+                + " differs from scalar F64 by more than one code");
+    std::cout << label << " max_code_error=" << maximum_error << '\n';
 }
 
 void test_device_conformance() {

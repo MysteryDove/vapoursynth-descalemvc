@@ -116,8 +116,8 @@ attempt on CPU, but the final route must remain observable.
    remain high precision. A safe companion uses its frozen F32 coefficients
    widened to the selected high-precision representation.
 7. Float output converts once after the final solve. Integer normalization,
-   scale, clamp, and rounding preserve the existing semantics; integer output
-   is bit exact.
+   scale, clamp, and rounding preserve the existing semantics. U8/U10/U16
+   output is within one code of the same-precision CPU scalar reference.
 8. Padding, geometry, coefficient order, band order, and custom-kernel behavior
    do not change. Backends consume planner output and never regenerate it.
 
@@ -206,7 +206,10 @@ Every backend follows this order:
 
 Native high precision should normally produce identical final F32 output; any
 difference is limited to one output ULP and cannot worsen the independent
-high-precision reference. Integer output is bit exact. NaN or infinity fails.
+high-precision reference. Integer output is within one code of the
+same-precision CPU scalar reference. Repeated execution on one concrete route,
+and CPU buffered/streamed or fused/two-pass route pairs, remain bit exact. NaN
+or infinity fails with `std::runtime_error`.
 
 ## Merge Order
 
@@ -243,7 +246,8 @@ Stop a backend branch without changing shared routing when:
   or two-axis intermediate to F32;
 - explicit CUDA/Vulkan can silently execute CPU;
 - high-precision float output exceeds one ULP or worsens an independent anchor;
-- integer output differs;
+- integer output differs from the same-precision CPU scalar reference by more
+  than one code;
 - target features or exact artifact evidence are missing;
 - an IR residual grows twice, stagnates, becomes nonfinite, or fails its
   eight-correction cap; or

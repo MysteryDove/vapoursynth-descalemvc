@@ -84,6 +84,7 @@ struct AxisFixture {
     std::uint32_t input_seed;
     std::int32_t expected_half_bandwidth;
     const char *f32_plan_hash;
+    const char *complete_plan_hash;
     const char *ordered_output_hash;
     const char *production_output_hash;
 };
@@ -112,41 +113,53 @@ struct AxisFixture {
         BorderMode::symmetric, mode);
 }
 
+[[nodiscard]] constexpr const char *complete_plan_golden(
+    const char *default_hash, const char *apple_hash = nullptr) noexcept {
+#if defined(__APPLE__)
+    return apple_hash ? apple_hash : default_hash;
+#else
+    (void)apple_hash;
+    return default_hash;
+#endif
+}
+
 [[nodiscard]] inline std::array<AxisFixture, 7> axis_fixtures() {
     return {{
         {"b1-symmetric-tail",
          make_axis_request(41, 35, 35.0, 0.1875, KernelKind::bilinear, 3,
                            BorderMode::symmetric, F64Mode::float32_only),
-         0xb1001001U, 1, "b7fa7ca018f14328", "71ea8a545feca1b7",
-         "ea1b09290d8d2d47"},
+         0xb1001001U, 1, "b7fa7ca018f14328", "61f3f18073fe9e11",
+         "71ea8a545feca1b7", "ea1b09290d8d2d47"},
         {"b3-reflect101-tail",
          make_axis_request(47, 39, 39.0, -0.3125, KernelKind::bicubic, 3,
                            BorderMode::reflect101, F64Mode::float32_only),
-         0xb3003003U, 3, "9a194da63434e8e1", "c2ec387c8df33a7b",
-         "7ec44696e0ae2e8c"},
+         0xb3003003U, 3, "9a194da63434e8e1", "a8ee51581e483134",
+         "c2ec387c8df33a7b", "7ec44696e0ae2e8c"},
         {"b5-repeat-tail",
          make_axis_request(59, 49, 49.0, 0.4375, KernelKind::lanczos, 3,
                            BorderMode::repeat, F64Mode::float32_only),
-         0xb5005005U, 5, "368aafc55d47f98c", "0230fd2270a8d447",
-         "a3b5a9429aaac189"},
+         0xb5005005U, 5, "368aafc55d47f98c",
+         complete_plan_golden("d7d468d0dcc3798e", "0ed8c2aa402279dd"),
+         "0230fd2270a8d447", "a3b5a9429aaac189"},
         {"b7-zero-tail",
          make_axis_request(67, 57, 57.0, -0.25, KernelKind::spline64, 3,
                            BorderMode::zero, F64Mode::float32_only),
-         0xb7007007U, 7, "68da8f096af1407f", "19b4db02b77aa1e6",
-         "8333021572f444c1"},
+         0xb7007007U, 7, "68da8f096af1407f", "dd8b79d05deb000e",
+         "19b4db02b77aa1e6", "8333021572f444c1"},
         {"conditioned-f32-control",
          conditioned_lanczos2_request(F64Mode::float32_only),
-         0xf3209781U, 3, "5bddb1a9d8c61225", "97b0409984eb7606",
-         "90fc1f98834e937e"},
+         0xf3209781U, 3, "5bddb1a9d8c61225", "162056d561d75888",
+         "97b0409984eb7606", "90fc1f98834e937e"},
         {"forced-f64-b3",
          make_axis_request(73, 61, 60.5, 0.125, KernelKind::bicubic, 3,
                            BorderMode::symmetric, F64Mode::float64_only),
-         0xf6400002U, 3, "8192da268d0b6655", "d4b9c8ff994a2520",
-         "d4b9c8ff994a2520"},
+         0xf6400002U, 3, "8192da268d0b6655", "b9ea390d346a2c8e",
+         "d4b9c8ff994a2520", "d4b9c8ff994a2520"},
         {"automatic-risk-f64",
          conditioned_lanczos2_request(F64Mode::automatic),
-         0xf6409781U, 3, "88de56a7458f03fd", "1c332683a9d93688",
-         "1c332683a9d93688"},
+         0xf6409781U, 3, "88de56a7458f03fd",
+         complete_plan_golden("b0ceea661114a07b", "bef07be61c4ea5ed"),
+         "1c332683a9d93688", "1c332683a9d93688"},
     }};
 }
 

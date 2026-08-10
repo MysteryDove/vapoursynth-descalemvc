@@ -1,13 +1,17 @@
 #include <dsmvc/engine.hpp>
 
 #include "axis_plan_internal.hpp"
+#include "checked_size.hpp"
 #include "cpu_packed.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <immintrin.h>
+#include <limits>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -50,16 +54,23 @@ struct F64Workspace {
 
 [[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_fma(
     F64Quad value, double coefficient, F64Quad source) noexcept {
-    value.lanes = _mm256_fmadd_pd(
-        _mm256_set1_pd(coefficient), source.lanes, value.lanes);
+    value.lanes = _mm256_add_pd(
+        _mm256_mul_pd(_mm256_set1_pd(coefficient), source.lanes),
+        value.lanes);
     return value;
 }
 
 [[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_fms(
     F64Quad value, double coefficient, F64Quad source) noexcept {
-    value.lanes = _mm256_fnmadd_pd(
-        _mm256_set1_pd(coefficient), source.lanes, value.lanes);
+    value.lanes = _mm256_sub_pd(
+        value.lanes,
+        _mm256_mul_pd(_mm256_set1_pd(coefficient), source.lanes));
     return value;
+}
+
+[[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_divide(
+    F64Quad value, double denominator) noexcept {
+    return {_mm256_div_pd(value.lanes, _mm256_set1_pd(denominator))};
 }
 
 [[nodiscard]] DSMVC_FORCE_INLINE F64Quad f64_quad_multiply(
@@ -111,9 +122,10 @@ void solve_axis_f64_quad(
 
     if constexpr (RetainedFloat64) {
         for (std::int32_t i = 0; i < n; ++i) {
-            values[static_cast<std::size_t>(i)] = f64_quad_multiply(
+            values[static_cast<std::size_t>(i)] = f64_quad_divide(
                 values[static_cast<std::size_t>(i)],
-                plan.inverse_diagonal_f64[static_cast<std::size_t>(i)]);
+                plan.ldlt_bands_f64[static_cast<std::size_t>(i)]
+                    + std::numeric_limits<double>::epsilon());
         }
     }
 
@@ -267,7 +279,7 @@ void inverse_rows_f64_avx2_impl(
             workspace.scalar_source[static_cast<std::size_t>(column)] =
                 static_cast<double>(source[column]);
         }
-        detail::inverse_axis_f64(
+        detail::inverse_axis_f64_ordered(
             plan, workspace.scalar_source.data(), 1,
             workspace.scalar_destination.data(), 1);
         auto *destination = output
@@ -320,7 +332,7 @@ void inverse_columns_f64_avx2_impl(
                     static_cast<std::ptrdiff_t>(row) * input_row_stride
                     + column]);
         }
-        detail::inverse_axis_f64(
+        detail::inverse_axis_f64_ordered(
             plan, workspace.scalar_source.data(), 1,
             workspace.scalar_destination.data(), 1);
         for (std::int32_t row = 0; row < plan.destination_size; ++row) {
@@ -360,16 +372,30 @@ DSMVC_FORCE_INLINE void transpose8(__m256 &row0, __m256 &row1, __m256 &row2, __m
 }
 
 void transpose_source(const float *input, std::ptrdiff_t stride,
+                      std::int32_t logical_width,
                       std::int32_t padded_width, float *scratch) noexcept {
     for (std::int32_t column = 0; column < padded_width; column += 8) {
-        __m256 x0 = _mm256_loadu_ps(input + column);
-        __m256 x1 = _mm256_loadu_ps(input + stride + column);
-        __m256 x2 = _mm256_loadu_ps(input + 2 * stride + column);
-        __m256 x3 = _mm256_loadu_ps(input + 3 * stride + column);
-        __m256 x4 = _mm256_loadu_ps(input + 4 * stride + column);
-        __m256 x5 = _mm256_loadu_ps(input + 5 * stride + column);
-        __m256 x6 = _mm256_loadu_ps(input + 6 * stride + column);
-        __m256 x7 = _mm256_loadu_ps(input + 7 * stride + column);
+        const auto remaining = std::clamp(logical_width - column, 0, 8);
+        const __m256i mask = _mm256_setr_epi32(
+            remaining > 0 ? -1 : 0, remaining > 1 ? -1 : 0,
+            remaining > 2 ? -1 : 0, remaining > 3 ? -1 : 0,
+            remaining > 4 ? -1 : 0, remaining > 5 ? -1 : 0,
+            remaining > 6 ? -1 : 0, remaining > 7 ? -1 : 0);
+        const auto load_row = [&](std::int32_t row) noexcept {
+            const auto *source = input
+                + static_cast<std::ptrdiff_t>(row) * stride + column;
+            return remaining == 8
+                ? _mm256_loadu_ps(source)
+                : _mm256_maskload_ps(source, mask);
+        };
+        __m256 x0 = load_row(0);
+        __m256 x1 = load_row(1);
+        __m256 x2 = load_row(2);
+        __m256 x3 = load_row(3);
+        __m256 x4 = load_row(4);
+        __m256 x5 = load_row(5);
+        __m256 x6 = load_row(6);
+        __m256 x7 = load_row(7);
         transpose8(x0, x1, x2, x3, x4, x5, x6, x7);
         _mm256_store_ps(scratch + static_cast<std::size_t>(column + 0) * 8U, x0);
         _mm256_store_ps(scratch + static_cast<std::size_t>(column + 1) * 8U, x1);
@@ -385,7 +411,7 @@ void transpose_source(const float *input, std::ptrdiff_t stride,
 template <class Sample>
 void transpose_integer_source(
     const Sample *input, std::ptrdiff_t stride,
-    std::int32_t padded_width, float input_offset,
+    std::int32_t logical_width, std::int32_t padded_width, float input_offset,
     float input_scale, float *scratch) noexcept {
     const __m256 offset = _mm256_set1_ps(input_offset);
     const __m256 scale = _mm256_set1_ps(input_scale);
@@ -393,6 +419,14 @@ void transpose_integer_source(
         const auto load_row = [&](std::int32_t row) {
             const auto *source = input
                 + static_cast<std::ptrdiff_t>(row) * stride + column;
+            const auto remaining = std::clamp(logical_width - column, 0, 8);
+            std::array<Sample, 8> tail{};
+            if (remaining != 8) {
+                std::memcpy(
+                    tail.data(), source,
+                    static_cast<std::size_t>(remaining) * sizeof(Sample));
+                source = tail.data();
+            }
             __m256i integers;
             if constexpr (std::is_same_v<Sample, std::uint8_t>) {
                 integers = _mm256_cvtepu8_epi32(
@@ -682,7 +716,9 @@ DSMVC_FLATTEN void solve_horizontal_block(
     const float *input, std::ptrdiff_t input_stride,
     float *output, std::ptrdiff_t output_stride,
     float *scratch) noexcept {
-    transpose_source(input, input_stride, packed.padded_source_size, scratch);
+    transpose_source(
+        input, input_stride, plan.source_size,
+        packed.padded_source_size, scratch);
     if (plan.half_bandwidth == 1) {
         solve_horizontal_b1(packed, scratch, output, output_stride);
     } else if (plan.half_bandwidth == 3) {
@@ -700,7 +736,7 @@ void solve_horizontal_integer_block(
     float *output, std::ptrdiff_t output_stride,
     float *scratch) noexcept {
     transpose_integer_source(
-        input, input_stride, packed.padded_source_size,
+        input, input_stride, plan.source_size, packed.padded_source_size,
         input_offset, input_scale, scratch);
     if (plan.half_bandwidth == 1) {
         solve_horizontal_b1(packed, scratch, output, output_stride);
@@ -1573,8 +1609,7 @@ DSMVC_FLATTEN void forward_2d_rhs_destination_impl(
     float *output, std::ptrdiff_t output_row_stride,
     std::int32_t columns) {
     const auto padded_columns = packed_horizontal.padded_destination_size;
-    const auto vector_columns = output_row_stride >= padded_columns
-        ? padded_columns : (columns & ~7);
+    const auto vector_columns = columns & ~7;
     const auto cache_blocks = static_cast<std::size_t>(
         std::max(packed_vertical.streaming_cache_blocks, 1));
 
@@ -1585,8 +1620,9 @@ DSMVC_FLATTEN void forward_2d_rhs_destination_impl(
     thread_local std::vector<const float *> source_rows;
     transpose_scratch.resize(
         static_cast<std::size_t>(packed_horizontal.padded_source_size));
-    horizontal_cache.resize(
-        cache_blocks * static_cast<std::size_t>(padded_columns));
+    horizontal_cache.resize(detail::checked_size_product(
+        cache_blocks, static_cast<std::size_t>(padded_columns),
+        "AVX2 horizontal cache"));
     cache_rows.assign(cache_blocks, -1);
     cache_ages.assign(cache_blocks, 0U);
     auto *transpose_data = transpose_scratch.front().lanes;
@@ -1732,15 +1768,7 @@ DSMVC_FLATTEN void backward_rhs_impl(
     float *input, std::ptrdiff_t input_row_stride,
     Sample *integer_output, std::ptrdiff_t integer_output_row_stride,
     std::int32_t columns, const IntegerConversion *conversion) noexcept {
-    const auto padded_columns = (columns + 7) & ~7;
-    const auto vector_columns = [&] {
-        if constexpr (std::is_same_v<Sample, float>) {
-            return input_row_stride >= padded_columns
-                ? padded_columns : (columns & ~7);
-        } else {
-            return columns & ~7;
-        }
-    }();
+    const auto vector_columns = columns & ~7;
     const auto n = plan.destination_size;
     const auto factor_stride = static_cast<std::size_t>(
         packed.padded_destination_size);
@@ -2023,74 +2051,6 @@ void backward_rhs_to_u16_avx2(
         output, output_row_stride, columns, &conversion);
 }
 
-void accumulate_2d_rhs_avx2(
-    const AxisPlan &horizontal,
-    const detail::PackedCpuPlan &packed_horizontal,
-    const detail::PackedCpuPlan &packed_vertical,
-    const float *input, std::ptrdiff_t input_row_stride,
-    float *output, std::ptrdiff_t output_row_stride,
-    std::int32_t first_destination_row,
-    std::int32_t last_destination_row) {
-    const auto columns = horizontal.destination_size;
-    const auto padded_columns = packed_horizontal.padded_destination_size;
-    const auto vector_columns = output_row_stride >= padded_columns
-        ? padded_columns : (columns & ~7);
-    const auto clear_columns = std::max(columns, vector_columns);
-    for (std::int32_t row = first_destination_row;
-         row < last_destination_row; ++row) {
-        std::fill_n(output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
-                    clear_columns, 0.0F);
-    }
-
-    thread_local std::vector<ScratchVector> transpose_scratch;
-    thread_local std::vector<ScratchVector> horizontal_scratch;
-    transpose_scratch.resize(
-        static_cast<std::size_t>(packed_horizontal.padded_source_size));
-    horizontal_scratch.resize(static_cast<std::size_t>(padded_columns));
-    auto *transpose_data = transpose_scratch.front().lanes;
-    auto *horizontal_rows = horizontal_scratch.front().lanes;
-
-    const auto process_block = [&](std::int32_t block_row,
-                                   std::int32_t first_source_row,
-                                   std::int32_t last_source_row) {
-        bool needed = false;
-        for (std::int32_t source_row = first_source_row;
-             source_row < last_source_row; ++source_row) {
-            if (source_reaches_destination_band(
-                    packed_vertical, source_row,
-                    first_destination_row, last_destination_row)) {
-                needed = true;
-                break;
-            }
-        }
-        if (!needed) return;
-        solve_horizontal_block(
-            horizontal, packed_horizontal,
-            input + static_cast<std::ptrdiff_t>(block_row) * input_row_stride,
-            input_row_stride, horizontal_rows, padded_columns,
-            transpose_data);
-        accumulate_horizontal_block(
-            packed_vertical, horizontal_rows, padded_columns,
-            block_row, first_source_row, last_source_row,
-            output, output_row_stride, vector_columns, columns,
-            first_destination_row, last_destination_row);
-    };
-
-    const auto source_rows = packed_vertical.axis->source_size;
-    const auto complete_rows = source_rows & ~7;
-    const auto tail_row = complete_rows == source_rows
-        ? source_rows : source_rows - 8;
-    for (std::int32_t row = 0; row < complete_rows; row += 8) {
-        const auto last_source_row = std::min(row + 8, tail_row);
-        if (row < last_source_row) {
-            process_block(row, row, last_source_row);
-        }
-    }
-    if (complete_rows != source_rows) {
-        process_block(tail_row, tail_row, source_rows);
-    }
-}
-
 void accumulate_2d_rhs_u8_avx2(
     const AxisPlan &horizontal,
     const detail::PackedCpuPlan &packed_horizontal,
@@ -2158,9 +2118,7 @@ void inverse_rows_avx2(const AxisPlan &plan,
                        const float *input, std::ptrdiff_t input_row_stride,
                        float *output, std::ptrdiff_t output_row_stride,
                        std::int32_t row_count) {
-    if (row_count < 8
-        || input_row_stride < packed.padded_source_size
-        || output_row_stride < packed.padded_destination_size) {
+    if (row_count < 8) {
         for (std::int32_t row = 0; row < row_count; ++row) {
             dsmvc::inverse_axis_f32(
                 plan, input + static_cast<std::ptrdiff_t>(row) * input_row_stride, 1,
@@ -2172,23 +2130,42 @@ void inverse_rows_avx2(const AxisPlan &plan,
     thread_local std::vector<ScratchVector> scratch;
     scratch.resize(static_cast<std::size_t>(packed.padded_source_size));
     auto *scratch_data = scratch.front().lanes;
+    const bool use_output_scratch =
+        plan.destination_size != packed.padded_destination_size;
+    thread_local std::vector<ScratchVector> padded_output;
+    if (use_output_scratch) {
+        padded_output.resize(
+            static_cast<std::size_t>(packed.padded_destination_size));
+    }
+    const auto solve_block = [&](std::int32_t row) {
+        auto *block_output = use_output_scratch
+            ? padded_output.front().lanes
+            : output + static_cast<std::ptrdiff_t>(row) * output_row_stride;
+        const auto block_output_stride = use_output_scratch
+            ? static_cast<std::ptrdiff_t>(packed.padded_destination_size)
+            : output_row_stride;
+        solve_horizontal_block(
+            plan, packed,
+            input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
+            input_row_stride, block_output, block_output_stride, scratch_data);
+        if (use_output_scratch) {
+            for (std::int32_t lane = 0; lane < 8; ++lane) {
+                std::copy_n(
+                    block_output
+                        + static_cast<std::ptrdiff_t>(lane)
+                            * block_output_stride,
+                    plan.destination_size,
+                    output + static_cast<std::ptrdiff_t>(row + lane)
+                        * output_row_stride);
+            }
+        }
+    };
     const auto complete_rows = row_count & ~7;
     for (std::int32_t row = 0; row < complete_rows; row += 8) {
-        solve_horizontal_block(
-            plan, packed,
-            input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
-            input_row_stride,
-            output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
-            output_row_stride, scratch_data);
+        solve_block(row);
     }
     if (complete_rows != row_count) {
-        const auto row = row_count - 8;
-        solve_horizontal_block(
-            plan, packed,
-            input + static_cast<std::ptrdiff_t>(row) * input_row_stride,
-            input_row_stride,
-            output + static_cast<std::ptrdiff_t>(row) * output_row_stride,
-            output_row_stride, scratch_data);
+        solve_block(row_count - 8);
     }
 }
 
@@ -2197,10 +2174,7 @@ void inverse_columns_avx2(const AxisPlan &plan,
                           const float *input, std::ptrdiff_t input_row_stride,
                           float *output, std::ptrdiff_t output_row_stride,
                           std::int32_t column_count) {
-    const auto padded_columns = (column_count + 7) & ~7;
-    const auto vector_columns = input_row_stride >= padded_columns
-            && output_row_stride >= padded_columns
-        ? padded_columns : (column_count & ~7);
+    const auto vector_columns = column_count & ~7;
     if (plan.half_bandwidth == 1) {
         solve_columns_b1(plan, packed, input, input_row_stride, output,
                          output_row_stride, vector_columns);

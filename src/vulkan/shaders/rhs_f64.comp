@@ -20,6 +20,12 @@ double plan_double(uint word) {
     return packDouble2x32(uvec2(plan_data[word], plan_data[word + 1U]));
 }
 
+double ordered_add_product(double value, double coefficient, double source) {
+    precise double product = coefficient * source;
+    precise double result = value + product;
+    return result;
+}
+
 double source_value(uint vector, uint index) {
     uint linear;
     if (pc.value[7] == 0U) {
@@ -59,9 +65,10 @@ void main() {
     const uint begin = plan_data[pc.value[9] + index];
     const uint end = plan_data[pc.value[9] + index + 1U];
     for (uint position = begin; position < end; ++position) {
-        sum = fma(
+        sum = ordered_add_product(
+            sum,
             plan_double(pc.value[11] + position * 2U),
-            source_value(vector, plan_data[pc.value[10] + position]), sum);
+            source_value(vector, plan_data[pc.value[10] + position]));
     }
     store_output(vector, index, sum);
 }

@@ -1,5 +1,9 @@
 # CUDA Float64 Execution Handover
 
+> Status: native retained-F64 CUDA execution is implemented. The staged
+> sections below are retained as design history; the arithmetic and acceptance
+> contracts describe the current implementation.
+
 ## Goal
 
 Add native CUDA Double execution for retained Float64 plans while preserving
@@ -105,16 +109,16 @@ Double fields.
 
 ### Arithmetic policy
 
-The current scalar CPU and ARM NEON F64 paths differ in contraction behavior.
-CUDA work starts only after the integrator lands the shared explicit-FMA F64
-oracle and immutable outputs described by the main plan. The correctness-first
-CUDA variant uses explicit round-to-nearest Double FMA and the frozen
-coefficient/band traversal. Do not infer the contract from an NVCC default and
-do not alter existing F32 translation-unit behavior globally.
+The scalar CPU path is the arithmetic oracle. CUDA uses explicit
+round-to-nearest Double multiply followed by add/subtract, preserves the frozen
+coefficient/band traversal, and applies the retained pivot as division by
+`D + epsilon`. Do not infer the contract from an NVCC default and do not alter
+existing F32 translation-unit behavior globally.
 
-A DFMA variant may be evaluated after the baseline passes. Retain it only if
-final float output is identical or within one output ULP, integer output is bit
-exact, and the independent high-precision error does not regress.
+A DFMA variant may be evaluated separately. Retain it only if
+final float output is identical or within one output ULP, integer output is
+within one code of scalar CPU F64, and the independent high-precision error
+does not regress.
 
 ### Executor dispatch
 
@@ -222,7 +226,7 @@ At minimum cover:
 
 Use scalar CPU F64 as the per-pixel implementation oracle and retain the direct
 QR/high-precision conditioned anchors from the shared fixture. Float results
-outside one output ULP or any integer difference fail admission.
+outside one output ULP or integer results outside one code fail admission.
 
 ## Explicit Backend Semantics
 
@@ -241,7 +245,7 @@ Stop and hand back the branch without shared integration if:
 - retained Double fields are not used end to end;
 - the 2D intermediate is Float32;
 - an F64 graph or plan cache can alias F32 state;
-- integer output differs;
+- integer output differs from scalar CPU F64 by more than one code;
 - a target artifact lacks the expected F64 code;
 - a supported explicit request can silently use CPU; or
 - target-device correctness cannot be reproduced from an exact binary.

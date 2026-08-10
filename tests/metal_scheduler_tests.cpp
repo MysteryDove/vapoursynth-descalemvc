@@ -1365,6 +1365,12 @@ int main() {
                                      876.0F, 64.0F, 1023U},
             dsmvc::IntegerConversion{0.0F, 1.0F / 1023.0F,
                                      1023.0F, 0.0F, 1023U});
+        test_resident_integer_conversion_keys<std::uint16_t>(
+            small_plan, integer_vertical,
+            dsmvc::IntegerConversion{4096.0F, 1.0F / 56064.0F,
+                                     56064.0F, 4096.0F, 65535U},
+            dsmvc::IntegerConversion{0.0F, 1.0F / 65535.0F,
+                                     65535.0F, 0.0F, 65535U});
         test_resident_in_flight_eviction_safety();
 
         first->close();

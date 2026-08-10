@@ -172,7 +172,8 @@ than IR but has expensive serial high-precision recurrence operations.
 2. Test cancellation, exponent gaps, conditioned pivots, signed zero, normal
    boundaries, and subnormal-adjacent values.
 3. Compare each primitive with CPU Double and inspect generated AIR/metallib.
-4. Stop if explicit FMA/order cannot be preserved or the low component is lost.
+4. Stop if the scalar oracle's separately rounded operation order cannot be
+   preserved or the low component is lost.
 
 ### METAL-0B: plan packing and status shell
 
@@ -211,7 +212,8 @@ invalidate the correct CPU F64 fallback or the candidate's numerical result.
 Only a passing candidate proceeds to:
 
 1. rows, columns, risky/risky 2D, and both mixed-axis directions;
-2. F32, U8, U10, and U16 with bit-exact integer output;
+2. F32, U8, U10, and U16 with integer output within one code of the
+   same-precision CPU scalar reference;
 3. bounded plan/workspace caching and concurrent scheduler clients;
 4. tails, strides, generic bandwidth, command failure, and eviction/re-upload;
 5. plugin integration by the shared integrator; and
@@ -225,7 +227,8 @@ not carry two unadmitted production strategies into shared routing.
 - Final F32 output is identical to CPU direct F64 when practical, otherwise at
   most one output ULP with no independent-oracle regression.
 - Retain the existing `3e-6` absolute guard near zero.
-- Integer output is bit exact.
+- Integer output is within one code of the same-precision CPU scalar reference;
+  repeated execution on one concrete Metal route remains bit exact.
 - IR converges within eight corrections for every admitted fixture and records
   all residual histories.
 - Direct float-float keeps the low component through the final axis.

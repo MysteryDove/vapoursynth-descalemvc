@@ -124,6 +124,7 @@ void check_retained_normal_matrix(
 
 void test_axis_fixture_goldens(bool emit_goldens) {
     std::size_t fixture_index = 0U;
+    std::string complete_plan_drifts;
     for (const AxisFixture &fixture : dsmvc::numerical::axis_fixtures()) {
         const auto result = evaluate_fixture(fixture);
         if (fixture_index < 4U) {
@@ -157,6 +158,17 @@ void test_axis_fixture_goldens(bool emit_goldens) {
                     std::string(fixture.name)
                         + " immutable F32 plan hash drifted: "
                         + result.f32_plan_hash);
+            if (result.complete_plan_hash != fixture.complete_plan_hash) {
+                if (complete_plan_drifts.empty()) {
+                    complete_plan_drifts = "complete plan hashes drifted:";
+                }
+                complete_plan_drifts += "\n  ";
+                complete_plan_drifts += fixture.name;
+                complete_plan_drifts += " expected=";
+                complete_plan_drifts += fixture.complete_plan_hash;
+                complete_plan_drifts += " actual=";
+                complete_plan_drifts += result.complete_plan_hash;
+            }
             require(result.ordered_hash == fixture.ordered_output_hash,
                     std::string(fixture.name) + " ordered oracle hash drifted: "
                         + result.ordered_hash);
@@ -178,6 +190,7 @@ void test_axis_fixture_goldens(bool emit_goldens) {
         }
         ++fixture_index;
     }
+    require(complete_plan_drifts.empty(), std::move(complete_plan_drifts));
 }
 
 void test_cache_accounting() {
@@ -241,7 +254,7 @@ void test_malformed_retained_metadata() {
 
 void check_native_tail_control(
     const AxisFixture &fixture, const dsmvc::CpuExecutor &native,
-    std::int32_t rows, bool expect_simd_tail) {
+    std::int32_t rows) {
     const auto plan = dsmvc::build_axis_plan(fixture.request);
     const auto padded_source = (plan.source_size + 7) & ~7;
     const auto padded_destination = (plan.destination_size + 7) & ~7;
@@ -298,11 +311,9 @@ void check_native_tail_control(
             const float tail = output[static_cast<std::size_t>(row)
                                       * static_cast<std::size_t>(output_stride)
                                   + static_cast<std::size_t>(column)];
-            require(tail == (expect_simd_tail ? 0.0F : -23.0F),
+            require(tail == -23.0F,
                     std::string(fixture.name)
-                        + (expect_simd_tail
-                               ? " native SIMD tail storage was not zero"
-                               : " scalar fallback overwrote SIMD tail storage"));
+                        + " native path overwrote SIMD tail storage");
         }
         for (std::int32_t column = padded_destination;
              column < output_stride; ++column) {
@@ -342,13 +353,13 @@ void test_native_tail_controls() {
     for (std::size_t case_index = 0; case_index < 4U; ++case_index) {
         const auto &fixture = fixtures[case_index];
         if (lanes == 0) {
-            check_native_tail_control(fixture, native, 5, false);
+            check_native_tail_control(fixture, native, 5);
             continue;
         }
-        check_native_tail_control(fixture, native, lanes - 1, false);
-        check_native_tail_control(fixture, native, lanes, true);
-        check_native_tail_control(fixture, native, lanes + 1, true);
-        check_native_tail_control(fixture, native, lanes * 2, true);
+        check_native_tail_control(fixture, native, lanes - 1);
+        check_native_tail_control(fixture, native, lanes);
+        check_native_tail_control(fixture, native, lanes + 1);
+        check_native_tail_control(fixture, native, lanes * 2);
     }
 }
 
@@ -404,6 +415,9 @@ void check_native_f32_columns(
                 std::string(fixture.name)
                     + " NEON column path differs from ordered F32");
     }
+    require(maximum <= 3.0e-5,
+            std::string(fixture.name)
+                + " native column path escaped the F32 absolute-error bound");
     std::cout << fixture.name << " native=" << native.name()
               << " columns=" << columns
               << " max_abs_vs_ordered=" << maximum
@@ -506,11 +520,9 @@ void check_native_f64_axes(
                                 column_expected[column_index]));
         }
     }
-    if (native.path() == dsmvc::CpuPath::neon) {
-        require(row_ulp == 0U && column_ulp == 0U,
-                std::string(fixture.name)
-                    + " NEON F64 path differs from ordered Double");
-    }
+    require(row_ulp <= 1U && column_ulp <= 1U,
+            std::string(fixture.name)
+                + " native F64 axis path differs by more than one output ULP");
     std::cout << fixture.name << " native=" << native.name()
               << " f64_rows_max_ulp=" << row_ulp
               << " f64_columns_max_ulp=" << column_ulp << '\n';

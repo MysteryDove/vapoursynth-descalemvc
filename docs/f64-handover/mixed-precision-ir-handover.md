@@ -195,8 +195,8 @@ Report the full iteration histogram, not only mean iterations. Separate:
 ## Definition of Done
 
 IR numerical correctness is complete only when shared fixtures, independent
-references, forced fallbacks, exact integer output, artifact inspection, target
-hardware, and complete residual histories all pass. A convergent standalone
-kernel or a float-float arithmetic microtest alone is not completion. Production
-or automatic routing additionally requires separately authorized plugin E2E
-evaluation.
+references, forced fallbacks, the one-code integer contract, artifact
+inspection, target hardware, and complete residual histories all pass. A
+convergent standalone kernel or a float-float arithmetic microtest alone is not
+completion. Production or automatic routing additionally requires separately
+authorized plugin E2E evaluation.

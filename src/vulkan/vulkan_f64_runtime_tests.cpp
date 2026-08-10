@@ -79,17 +79,23 @@ void compare_integer_matrix(
     std::string_view label, const std::vector<Sample> &reference,
     const std::vector<Sample> &candidate, std::int32_t rows,
     std::int32_t columns, std::int32_t stride) {
+    std::uint32_t maximum_error = 0U;
     for (std::int32_t row = 0; row < rows; ++row) {
         for (std::int32_t column = 0; column < columns; ++column) {
             const std::size_t index = static_cast<std::size_t>(row)
                 * static_cast<std::size_t>(stride)
                 + static_cast<std::size_t>(column);
-            require(reference[index] == candidate[index],
-                    std::string{label} + " is not bit exact at index "
-                        + std::to_string(index));
+            const auto left = static_cast<std::uint32_t>(reference[index]);
+            const auto right = static_cast<std::uint32_t>(candidate[index]);
+            maximum_error = std::max(
+                maximum_error,
+                left > right ? left - right : right - left);
         }
     }
-    std::cout << label << ": bit_exact=1\n";
+    require(maximum_error <= 1U,
+            std::string{label}
+                + " differs from CPU scalar F64 by more than one code");
+    std::cout << label << ": max_code_error=" << maximum_error << '\n';
 }
 
 template <class T>

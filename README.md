@@ -33,12 +33,12 @@ It does not register a `core.descale` alias.
 
 | Backend | Float32 | Float64 | Integer output | Routing |
 |---|---|---|---|---|
-| CPU scalar | ✅ | ✅ | bit-exact | `auto` / explicit |
-| CPU AVX2 (x86-64) | ✅ | ✅ | bit-exact | `auto` / explicit |
-| CPU NEON (AArch64) | ✅ | ✅ | bit-exact | `auto` / explicit |
-| CUDA | ✅ | ✅ | bit-exact | explicit only |
-| Vulkan 1.2 | ✅ | ✅¹ | bit-exact | explicit only |
-| Metal (Apple ARM64) | ✅ | routed to CPU² | — | mixed plugin-level |
+| CPU scalar | ✅ | ✅ | reference | `auto` / explicit |
+| CPU AVX2 (x86-64) | ✅ | ✅ | <= 1 code vs scalar | `auto` / explicit |
+| CPU NEON (AArch64) | ✅ | ✅ | <= 1 code vs scalar | `auto` / explicit |
+| CUDA | ✅ | ✅ | <= 1 code vs scalar | explicit only |
+| Vulkan 1.2 | ✅ | ✅¹ | <= 1 code vs scalar | explicit only |
+| Metal (Apple ARM64) | ✅ | routed to CPU² | <= 1 code vs scalar | mixed plugin-level |
 
 ¹ Vulkan Float64 requires a strict device capability contract:
 `shaderFloat64`, RTE Float64 rounding, and NaN/Inf/signed-zero preservation.
@@ -51,11 +51,21 @@ subnormal intermediates.
 routes Float64 plans to its CPU fallback; the direct Metal executor rejects
 Float64 plans explicitly.
 
-Float64 output matches the CPU scalar Float64 reference within 1 output ULP
-on every backend; integer output (U8/U10/U16) is bit-exact. Automatic routing
-never selects a Float64 plan on a GPU backend — that admission requires
-paired plugin-level evidence against the optimized CPU Float64 path, which
-has not yet been collected.
+Float64 float output matches the CPU scalar Float64 reference within 1 output
+ULP on every backend. For both F32 and F64 solves, U8/U10/U16 output differs
+from the same-precision CPU scalar reference by at most 1 code; pairwise
+backend differences are not the contract. Repeated execution on one concrete
+route is bit-exact, and CPU buffered/streamed plus fused/two-pass dynamic
+routes are bit-exact with each other. Automatic routing never selects a
+Float64 plan on a GPU backend -- that admission requires paired plugin-level
+evidence against the optimized CPU Float64 path, which has not yet been
+collected.
+
+Retained-F64 entry points reject NaN or infinity in their input or result with
+`std::runtime_error`; signed zero and finite subnormals remain valid. Public
+matrix executors access only each row's logical width. A caller may allocate
+exactly `(rows - 1) * stride + logical_width` elements, without full pitch
+padding after the final row, and output padding is never modified.
 
 ```mermaid
 flowchart LR
@@ -114,13 +124,15 @@ scheduler routes a Float64 plan to its CPU fallback.
 `backend` accepts `auto`, `cpu`, `metal`, `vulkan`, or `cuda`. A normal build
 uses CPU for `auto`. Enabled builds accept `cuda` or `vulkan` on a compatible
 device. The opt-in Apple ARM64 Metal build adds explicit fixed-recipe GRAYS and
-YUV420P8/P10 routes. Its automatic route remains limited to measured
-wide-kernel YUV420 clips with at least 256 frames, at least 16 core threads, and
-a 16-callback admission window on a unified-memory Apple M-series device. Short
-clips, narrow kernels, GRAYS, low concurrency, and unsupported geometry remain
-on CPU under `auto`. An unavailable or uncompiled explicit backend raises an
-error. Explicit CUDA and Vulkan do not silently fall back; explicit Metal is a
-mixed plugin-level route and publishes whether a frame actually used Metal.
+YUV420P8/P10 routes. Its automatic route requires at least 64 frames, at least
+8 core threads, a wide kernel, sufficient measured work, and concurrent or
+resident-source admission on a unified-memory Apple M-series device. GRAY as
+well as YUV formats may participate when their format and dimensions satisfy
+those gates. Short clips, narrow kernels, low concurrency, and unsupported
+geometry remain on CPU under `auto`. An unavailable or uncompiled explicit
+backend raises an error. Explicit CUDA and Vulkan do not silently fall back;
+explicit Metal is a mixed plugin-level route and publishes whether a frame
+actually used Metal.
 
 For the CPU backend, `opt=1` selects the scalar path and `opt=2` strictly
 requires the architecture's native SIMD path: AVX2/FMA on x86-64 or NEON/FMA
@@ -129,6 +141,11 @@ values retain baseline behavior and select automatic dispatch. The Python
 wrapper accepts either these integers or `Opt.AUTO`, `Opt.NONE`, `Opt.AVX2`,
 `Opt.NEON`, and `Opt.SIMD`; the last three names all preserve the legacy
 `opt=2` value.
+
+At the public engine level, explicitly requesting `CpuPath::avx2` or
+`CpuPath::neon` also requires that exact path to be compiled and supported by
+the current CPU; it raises an error otherwise. Only `CpuPath::automatic` may
+fall back to scalar.
 
 Planning is deferred until the first requested frame. The inverse-only planner
 uses Float64 CSR and banded LDLT construction, stores immutable Float32
@@ -171,7 +188,9 @@ Requirements:
 Native Apple ARM64 Release and RelWithDebInfo builds use `-O3 -flto=full`
 without an Apple-model-specific `-mcpu` setting. CMake selects the NEON source
 only for AArch64 and the existing AVX2/FMA source only for x86-64; universal
-macOS builds must be produced as separate architecture builds.
+macOS builds must be produced as separate architecture builds. Set
+`DSMVC_ENABLE_NATIVE_CPU_SIMD=OFF` for a scalar-only portability or
+contract-test build; normal builds leave it enabled.
 
 The Metal backend is enabled by default only for native Apple ARM64 builds with
 the Xcode Metal toolchain. Release packages set the backend and deployment

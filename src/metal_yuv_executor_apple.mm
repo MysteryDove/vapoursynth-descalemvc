@@ -138,6 +138,11 @@ struct MetalYuvExecutor::Impl {
                 || !horizontal[index]->valid() || !vertical[index]->valid()) {
                 throw std::invalid_argument("experimental Metal YUV plan is invalid");
             }
+            if (horizontal[index]->requires_float64()
+                || vertical[index]->requires_float64()) {
+                throw std::invalid_argument(
+                    "experimental Metal YUV executor supports F32 plans only");
+            }
         }
 
         device = MTLCreateSystemDefaultDevice();

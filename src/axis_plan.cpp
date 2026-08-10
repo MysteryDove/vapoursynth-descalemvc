@@ -1389,14 +1389,24 @@ void inverse_axis_f32(
         std::vector<double> destination(
             static_cast<std::size_t>(plan.destination_size));
         for (std::int32_t i = 0; i < plan.source_size; ++i) {
-            source[static_cast<std::size_t>(i)] = static_cast<double>(
-                input[static_cast<std::ptrdiff_t>(i) * input_stride]);
+            const float value =
+                input[static_cast<std::ptrdiff_t>(i) * input_stride];
+            if (!std::isfinite(value)) {
+                throw std::runtime_error(
+                    "Float64 inverse axis input contains NaN or infinity");
+            }
+            source[static_cast<std::size_t>(i)] = static_cast<double>(value);
         }
         detail::inverse_axis_f64(
             plan, source.data(), 1, destination.data(), 1);
         for (std::int32_t i = 0; i < plan.destination_size; ++i) {
-            output[static_cast<std::ptrdiff_t>(i) * output_stride] =
-                static_cast<float>(destination[static_cast<std::size_t>(i)]);
+            const double value = destination[static_cast<std::size_t>(i)];
+            const float converted = static_cast<float>(value);
+            if (!std::isfinite(value) || !std::isfinite(converted)) {
+                throw std::runtime_error(
+                    "Float64 inverse axis produced NaN or infinity");
+            }
+            output[static_cast<std::ptrdiff_t>(i) * output_stride] = converted;
         }
         return;
     }

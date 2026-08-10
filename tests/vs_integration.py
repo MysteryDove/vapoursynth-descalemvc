@@ -122,8 +122,9 @@ def baseline_call(namespace, name: str, source, **overrides):
 
 
 def patterned_integer_clip(core, format_id, property_name: str,
-                           range_value: int):
-    blank = core.std.BlankClip(width=96, height=64, format=format_id)
+                           range_value: int, *, width: int = 96,
+                           height: int = 64):
+    blank = core.std.BlankClip(width=width, height=height, format=format_id)
 
     def fill(n, f):
         del n
@@ -140,6 +141,51 @@ def patterned_integer_clip(core, format_id, property_name: str,
         return output
 
     return core.std.ModifyFrame(blank, blank, fill)
+
+
+def require_frames_bit_exact(reference, candidate, label: str) -> None:
+    require(len(reference) == len(candidate), f"{label}: frame count differs")
+    for frame_number, (left, right) in enumerate(
+            zip(reference, candidate, strict=True)):
+        require(left.format.id == right.format.id,
+                f"{label}: format differs at frame {frame_number}")
+        for plane in range(left.format.num_planes):
+            left_view = memoryview(left[plane])
+            right_view = memoryview(right[plane])
+            require(left_view.shape == right_view.shape,
+                    f"{label}: plane shape differs at frame {frame_number}")
+            require(left_view.tobytes() == right_view.tobytes(),
+                    f"{label}: output is not bit exact at frame "
+                    f"{frame_number}, plane {plane}")
+
+
+def test_cpu_dynamic_route(core, threads: int) -> None:
+    require(threads > 1, "CPU dynamic-route test requires multiple core threads")
+    frame_count = max(8, min(threads, 16))
+
+    float_center = core.std.BlankClip(
+        width=400, height=300, length=1, format=vs.GRAYS, color=[0.2])
+    float_frame = core.std.AddBorders(
+        float_center, left=200, right=200, top=150, bottom=150,
+        color=[0.8])
+    float_source = core.std.Loop(float_frame, times=frame_count)
+
+    integer_frame = patterned_integer_clip(
+        core, vs.GRAY16, "_Range", 1, width=800, height=600)
+    integer_source = core.std.Loop(integer_frame, times=frame_count)
+
+    for source, label in (
+            (float_source, "float-two-pass-vs-fused"),
+            (integer_source, "integer-buffered-vs-streamed")):
+        serial_clip = core.dsmvc.Delanczos(
+            source, width=640, height=480, taps=3, backend="cpu")
+        concurrent_clip = core.dsmvc.Delanczos(
+            source, width=640, height=480, taps=3, backend="cpu")
+        serial_frames = [serial_clip.get_frame(n) for n in range(frame_count)]
+        concurrent_frames = list(concurrent_clip.frames(
+            prefetch=frame_count, backlog=frame_count * 2))
+        require_frames_bit_exact(
+            serial_frames, concurrent_frames, f"cpu-dynamic-route/{label}")
 
 
 def run(options) -> None:
@@ -188,13 +234,25 @@ def run(options) -> None:
                 source = patterned_integer_clip(
                     core, format_id, property_name, int(range_value))
                 for name in ("Debilinear", "Delanczos", "Despline64"):
-                    old = direct_call(core.descale, name, source)
+                    old = baseline_call(core.descale, name, source)
                     new = direct_call(
                         core.dsmvc, name, source, backend="cpu")
                     compare_clips(
                         old, new,
                         f"range/{source.format.name}/{property_name}/"
                         f"{range_value}/{name}")
+
+    patterned_gray16 = patterned_integer_clip(
+        core, vs.GRAY16, "_Range", 1)
+    patterned_scalar = direct_call(
+        core.dsmvc, "Debicubic", patterned_gray16,
+        backend="cpu", opt=1, f64mode=1)
+    patterned_simd = direct_call(
+        core.dsmvc, "Debicubic", patterned_gray16,
+        backend="cpu", opt=2, f64mode=1)
+    compare_clips(
+        patterned_scalar, patterned_simd,
+        "integer-contract/GRAY16-96x64-to-80x48/scalar-vs-simd")
 
     geometry = {
         "src_left": 0.25,
@@ -333,6 +391,12 @@ def run(options) -> None:
                 core.dsmvc, "Debicubic", source, backend="vulkan")
             compare_clips(
                 cpu, vulkan, f"backend/cpu-vs-vulkan/{source.format.name}")
+        patterned_vulkan = direct_call(
+            core.dsmvc, "Debicubic", patterned_gray16,
+            backend="vulkan", f64mode=1)
+        compare_clips(
+            patterned_scalar, patterned_vulkan,
+            "integer-contract/GRAY16-96x64-to-80x48/vulkan")
     else:
         expect_error(
             lambda: core.dsmvc.Debicubic(
@@ -342,6 +406,12 @@ def run(options) -> None:
         cuda = core.dsmvc.Debicubic(
             float_source, width=80, height=48, backend="cuda")
         compare_clips(scalar, cuda, "backend/cpu-vs-cuda")
+        patterned_cuda = direct_call(
+            core.dsmvc, "Debicubic", patterned_gray16,
+            backend="cuda", f64mode=1)
+        compare_clips(
+            patterned_scalar, patterned_cuda,
+            "integer-contract/GRAY16-96x64-to-80x48/cuda")
     else:
         expect_error(
             lambda: core.dsmvc.Debicubic(
@@ -433,6 +503,8 @@ def run(options) -> None:
                 backend="cpu", **kernel_arguments)
             large_output.get_frame(0)
             large_output.get_frame(0)
+
+    test_cpu_dynamic_route(core, options.threads)
 
     print("dsmvc VapourSynth integration tests passed")
 
