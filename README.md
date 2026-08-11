@@ -9,6 +9,20 @@
 Irrational-Encoding-Wizardry/descale, with native CPU (scalar/AVX2/NEON),
 CUDA, Vulkan, and Apple Metal execution routes.
 
+## Hardware support at a glance
+
+| Route | Supported hardware |
+|---|---|
+| CPU | x86-64 with a universal scalar path and optional AVX2/FMA acceleration; ARM64/AArch64 with scalar and NEON/FMA paths. Automatic routing selects the fastest path supported by the current CPU. |
+| CUDA | NVIDIA Turing or newer (compute capability 7.5+) on Windows and Linux. Default builds include native SM75, SM86, SM89, and SM120 kernels, covering GeForce GTX 16/RTX 20, RTX 30, RTX 40, and RTX 50 series respectively. |
+| Vulkan | Windows or Linux devices with a Vulkan 1.2 driver. Float64 additionally requires the capabilities listed in [Backend support](#backend-support). |
+| Metal | Apple Silicon M-series systems on macOS 13.3 or newer. Retained-Float64 work uses the CPU fallback. |
+
+CUDA devices without a matching native image can use the embedded compute_75
+or compute_120 PTX through NVIDIA driver JIT when compatible. This requires a
+sufficiently recent driver and may add a one-time startup delay. CUDA is an
+optional build feature and is selected explicitly with `backend="cuda"`.
+
 > **Release performance:** `dsmvc` reaches **13.13x** the original descale
 > throughput on the full `getfnative` scan at R1T1, and remains **6.45x faster**
 > at R32T32. See the [full release benchmark](docs/release-benchmark.md) for
